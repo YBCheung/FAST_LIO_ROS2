@@ -20,6 +20,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include "use-ikfom.hpp"
+#include "imu_preintegration.hpp"
 
 /// *************Preconfiguration
 
@@ -48,6 +49,18 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+
+  // NEW: Fast IMU propagation for high-frequency output
+  void fastPredictIMU(double t, const V3D &linear_acceleration, const V3D &angular_velocity);
+  
+  // NEW: Get latest propagated state
+  state_ikfom getLatestState() const { return latest_state_; }
+  
+  // NEW: Enable/disable high-frequency propagation
+  void enableHighFreqPropagation(bool enable) { high_freq_enabled_ = enable; }
+  
+  // NEW: Sync state from LiDAR odometry correction
+  void syncStateFromLidar(const state_ikfom &corrected_state);
 
   ofstream fout_imu;
   V3D cov_acc;
@@ -79,6 +92,16 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+  
+  // NEW: Latest propagated state for high-frequency output
+  state_ikfom latest_state_;
+  V3D latest_acc_;
+  V3D latest_gyr_;
+  double latest_time_;
+  bool high_freq_enabled_;
+  
+  // NEW: IMU preintegration buffer
+  std::shared_ptr<IMUPreintegration> pre_integration_;
 };
 
 ImuProcess::ImuProcess()
@@ -96,6 +119,13 @@ ImuProcess::ImuProcess()
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   last_imu_.reset(new sensor_msgs::msg::Imu());
+  
+  // NEW: Initialize high-frequency propagation
+  latest_acc_ = Zero3d;
+  latest_gyr_ = Zero3d;
+  latest_time_ = 0.0;
+  high_freq_enabled_ = false;
+  pre_integration_.reset(new IMUPreintegration(Zero3d, Zero3d));
 }
 
 ImuProcess::~ImuProcess() {}
@@ -376,4 +406,69 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   t3 = omp_get_wtime();
   
   // cout<<"[ IMU Process ]: Time: "<<t3 - t1<<endl;
+}
+
+void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const V3D &angular_velocity)
+{
+    if (!high_freq_enabled_) return;
+    
+    double dt = t - latest_time_;
+    if (dt <= 0) return; // Skip if time goes backwards
+    
+    latest_time_ = t;
+    
+    // Mid-point integration
+    V3D un_acc_0 = latest_state_.rot * (latest_acc_ - latest_state_.ba) - V3D(0, 0, -G_m_s2);
+    V3D un_gyr = 0.5 * (latest_gyr_ + angular_velocity) - latest_state_.bg;
+    
+    // Update rotation
+    Eigen::Quaterniond dq;
+    V3D omega = un_gyr * dt;
+    double omega_norm = omega.norm();
+    if(omega_norm > 1e-5) {
+        double half_theta = omega_norm / 2.0;
+        dq.w() = cos(half_theta);
+        dq.vec() = sin(half_theta) / omega_norm * omega;
+    } else {
+        dq.w() = 1.0;
+        dq.vec() = omega / 2.0;
+    }
+    
+    Eigen::Quaterniond q(latest_state_.rot.w(), 
+                         latest_state_.rot.vec()[0], 
+                         latest_state_.rot.vec()[1], 
+                         latest_state_.rot.vec()[2]);
+    q = q * dq;
+    q.normalize();
+    
+    latest_state_.rot.w() = q.w();
+    latest_state_.rot.vec()[0] = q.x();
+    latest_state_.rot.vec()[1] = q.y();
+    latest_state_.rot.vec()[2] = q.z();
+    
+    // Update acceleration and velocity
+    V3D un_acc_1 = latest_state_.rot * (linear_acceleration - latest_state_.ba) - V3D(0, 0, -G_m_s2);
+    V3D un_acc = 0.5 * (un_acc_0 + un_acc_1);
+    
+    // Update position and velocity
+    latest_state_.pos = latest_state_.pos + dt * latest_state_.vel + 0.5 * dt * dt * un_acc;
+    latest_state_.vel = latest_state_.vel + dt * un_acc;
+    
+    // Store for next iteration
+    latest_acc_ = linear_acceleration;
+    latest_gyr_ = angular_velocity;
+}
+
+void ImuProcess::syncStateFromLidar(const state_ikfom &corrected_state)
+{
+    if (!high_freq_enabled_) return;
+    
+    latest_state_ = corrected_state;
+    latest_time_ = rclcpp::Clock().now().seconds(); // Use current time
+    
+    // Reset preintegration with corrected state
+    if(pre_integration_) {
+        pre_integration_.reset(new IMUPreintegration(
+            corrected_state.ba, corrected_state.bg));
+    }
 }
