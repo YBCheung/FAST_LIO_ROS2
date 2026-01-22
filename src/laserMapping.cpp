@@ -84,6 +84,10 @@ double time_diff_lidar_to_imu = 0.0;
 mutex mtx_buffer;
 condition_variable sig_buffer;
 
+// NEW: Global variables for high-frequency propagation
+std::mutex mtx_highfreq_state;
+bool enable_highfreq_output = true;
+
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 
@@ -345,6 +349,61 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+}
+
+// Forward declaration for high-frequency publisher
+rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubHighFreqOdom_global;
+
+// NEW: High-frequency IMU callback (processes every IMU at 200Hz)
+void imu_highfreq_callback(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+{
+    if(!enable_highfreq_output || !pubHighFreqOdom_global) return;
+    
+    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+    double timestamp = get_time_sec(msg->header.stamp);
+    
+    mtx_highfreq_state.lock();
+    
+    // Extract IMU data
+    V3D acc(msg->linear_acceleration.x, 
+            msg->linear_acceleration.y, 
+            msg->linear_acceleration.z);
+    V3D gyr(msg->angular_velocity.x,
+            msg->angular_velocity.y,
+            msg->angular_velocity.z);
+    
+    // Fast propagate state
+    p_imu->fastPredictIMU(timestamp, acc, gyr);
+    
+    // Get propagated state
+    state_ikfom propagated_state = p_imu->getLatestState();
+    
+    mtx_highfreq_state.unlock();
+    
+    // Publish high-frequency odometry
+    nav_msgs::msg::Odometry odom_highfreq;
+    odom_highfreq.header = msg->header;
+    odom_highfreq.header.frame_id = "camera_init";
+    odom_highfreq.child_frame_id = "body";
+    
+    odom_highfreq.pose.pose.position.x = propagated_state.pos(0);
+    odom_highfreq.pose.pose.position.y = propagated_state.pos(1);
+    odom_highfreq.pose.pose.position.z = propagated_state.pos(2);
+    
+    Eigen::Quaterniond q(propagated_state.rot.w(),
+                         propagated_state.rot.vec()[0],
+                         propagated_state.rot.vec()[1],
+                         propagated_state.rot.vec()[2]);
+    odom_highfreq.pose.pose.orientation.w = q.w();
+    odom_highfreq.pose.pose.orientation.x = q.x();
+    odom_highfreq.pose.pose.orientation.y = q.y();
+    odom_highfreq.pose.pose.orientation.z = q.z();
+    
+    odom_highfreq.twist.twist.linear.x = propagated_state.vel(0);
+    odom_highfreq.twist.twist.linear.y = propagated_state.vel(1);
+    odom_highfreq.twist.twist.linear.z = propagated_state.vel(2);
+    
+    pubHighFreqOdom_global->publish(odom_highfreq);
 }
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
@@ -833,6 +892,14 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        
+        // NEW: High-frequency propagation parameters
+        this->declare_parameter<bool>("imu_propagation.enable_high_frequency", true);
+        this->declare_parameter<int>("imu_propagation.publish_frequency", 200);
+        this->declare_parameter<double>("imu_propagation.acc_n", 0.1);
+        this->declare_parameter<double>("imu_propagation.gyr_n", 0.01);
+        this->declare_parameter<double>("imu_propagation.acc_w", 0.0001);
+        this->declare_parameter<double>("imu_propagation.gyr_w", 0.00001);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -869,6 +936,18 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        
+        // NEW: Get high-frequency propagation parameters
+        bool enable_high_freq = true;
+        int pub_freq = 200;
+        double acc_n = 0.1, gyr_n = 0.01, acc_w = 0.0001, gyr_w = 0.00001;
+        this->get_parameter_or<bool>("imu_propagation.enable_high_frequency", enable_high_freq, true);
+        this->get_parameter_or<int>("imu_propagation.publish_frequency", pub_freq, 200);
+        this->get_parameter_or<double>("imu_propagation.acc_n", acc_n, 0.1);
+        this->get_parameter_or<double>("imu_propagation.gyr_n", gyr_n, 0.01);
+        this->get_parameter_or<double>("imu_propagation.acc_w", acc_w, 0.0001);
+        this->get_parameter_or<double>("imu_propagation.gyr_w", gyr_w, 0.00001);
+        enable_highfreq_output = enable_high_freq;
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -933,6 +1012,17 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        
+        // NEW: Create high-frequency odometry publisher and subscribe to IMU
+        if (enable_high_freq) {
+            pubHighFreqOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/high_freq_odom", 1000);
+            pubHighFreqOdom_global = pubHighFreqOdom_;
+            sub_imu_highfreq_ = this->create_subscription<sensor_msgs::msg::Imu>(
+                imu_topic, 2000, imu_highfreq_callback);
+            p_imu->enableHighFreqPropagation(true);
+            RCLCPP_INFO(this->get_logger(), "High-frequency IMU propagation enabled at %d Hz", pub_freq);
+        }
+        
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -1060,6 +1150,14 @@ private:
 
             double t_update_end = omp_get_wtime();
 
+            // NEW: Sync high-frequency state with corrected lidar odometry
+            if (enable_highfreq_output)
+            {
+                mtx_highfreq_state.lock();
+                p_imu->syncStateFromLidar(state_point);
+                mtx_highfreq_state.unlock();
+            }
+
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
@@ -1135,7 +1233,9 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubHighFreqOdom_; // NEW: High-frequency odometry publisher
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_highfreq_; // NEW: High-frequency IMU subscription
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 

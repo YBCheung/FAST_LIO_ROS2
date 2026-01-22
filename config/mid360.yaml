@@ -48,3 +48,13 @@
             pcd_save_en: true
             interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+
+        imu_propagation:
+            enable_high_frequency: true
+            publish_frequency: 200  # Hz
+            
+            # Noise parameters for preintegration
+            acc_n: 0.1              # accelerometer noise
+            gyr_n: 0.01             # gyroscope noise  
+            acc_w: 0.0001           # accelerometer bias random walk
+            gyr_w: 0.00001          # gyroscope bias random walk
