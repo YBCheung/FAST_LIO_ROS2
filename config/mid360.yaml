@@ -44,6 +44,46 @@
             dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
+        color_mapping:
+            input_source: "livox"            # livox | world_cloud
+            livox_topic: "/livox/lidar"      # used when input_source=livox
+            cloud_topic: "/Laser_map"        # used when input_source=world_cloud
+            odom_topic: "/high_freq_odom"       # used for color mapping and time synchronization
+            rgb_topic: "/camera/color/image_raw/compressed"
+            depth_topic: "/camera/depth/image_raw/compressedDepth"
+            camera_info_topic: "/camera/color/camera_info"
+
+            colored_scan_topic: "/cloud_registered_color"
+            colored_map_topic: "/laser_map_color"
+            world_frame: "world"
+
+            use_camera_info: true
+            fx: 0.0
+            fy: 0.0
+            cx: 0.0
+            cy: 0.0
+
+            T_cam_lidar: [ 0.0280838, -0.981278, 0.190538, -0.602142,
+                            -0.217406, -0.192047, -0.957002, 0.762459,
+                            0.975677, -0.0145479, -0.218729, 0.394083,
+                            0.0, 0.0, 0.0, 1.0 ]
+            invert_extrinsic: false
+
+            max_image_time_diff: 0.05   # 20hz
+            max_depth_time_diff: 0.05   # 20hz
+            max_odom_time_diff: 0.01    # 100hz
+
+            use_depth_gate: true
+            depth_tolerance: 0.5
+            depth_scale: 0.001
+            min_depth: 0.1
+            max_depth: 80.0
+
+            map_voxel_size: 0.1
+            publish_map_every_n: 5
+            max_queue_size: 100
+            filter_livox_tags: true
+
         pcd_save:
             pcd_save_en: true
             interval: -1                 # how many LiDAR frames saved in each pcd file; 

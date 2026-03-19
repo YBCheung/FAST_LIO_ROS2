@@ -383,7 +383,7 @@ void imu_highfreq_callback(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     // Publish high-frequency odometry
     nav_msgs::msg::Odometry odom_highfreq;
     odom_highfreq.header = msg->header;
-    odom_highfreq.header.frame_id = "camera_init";
+    odom_highfreq.header.frame_id = "world";
     odom_highfreq.child_frame_id = "body";
     
     odom_highfreq.pose.pose.position.x = propagated_state.pos(0);

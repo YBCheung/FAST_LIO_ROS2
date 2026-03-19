@@ -54,6 +54,7 @@ find_package(rclcpp_components REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
@@ -68,6 +69,7 @@ set(dependencies
   geometry_msgs
   nav_msgs
   sensor_msgs
+  cv_bridge
   std_msgs
   std_srvs
   visualization_msgs
@@ -115,8 +117,18 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+add_executable(lidar_camera_colorizer_node src/lidar_camera_colorizer_node.cpp)
+target_include_directories(lidar_camera_colorizer_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(lidar_camera_colorizer_node ${PCL_LIBRARIES} Eigen3::Eigen)
+ament_target_dependencies(lidar_camera_colorizer_node ${dependencies})
+
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping
+  lidar_camera_colorizer_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

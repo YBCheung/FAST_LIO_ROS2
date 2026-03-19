@@ -43,6 +43,7 @@ class ImuProcess
   void set_extrinsic(const V3D &transl, const M3D &rot);
   void set_extrinsic(const V3D &transl);
   void set_extrinsic(const MD(4,4) &T);
+  void set_imu_to_body(const M3D &rot);
   void set_gyr_cov(const V3D &scaler);
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
@@ -83,6 +84,7 @@ class ImuProcess
   vector<M3D>    v_rot_pcl_;
   M3D Lidar_R_wrt_IMU;
   V3D Lidar_T_wrt_IMU;
+  M3D R_imu_to_body;
   V3D mean_acc;
   V3D mean_gyr;
   V3D angvel_last;
@@ -118,6 +120,7 @@ ImuProcess::ImuProcess()
   angvel_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
+  R_imu_to_body = Eye3d;
   last_imu_.reset(new sensor_msgs::msg::Imu());
   
   // NEW: Initialize high-frequency propagation
@@ -163,6 +166,11 @@ void ImuProcess::set_extrinsic(const V3D &transl, const M3D &rot)
   Lidar_R_wrt_IMU = rot;
 }
 
+void ImuProcess::set_imu_to_body(const M3D &rot)
+{
+  R_imu_to_body = rot;
+}
+
 void ImuProcess::set_gyr_cov(const V3D &scaler)
 {
   cov_gyr_scale = scaler;
@@ -199,6 +207,8 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     const auto &gyr_acc = meas.imu.front()->angular_velocity;
     mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+    mean_acc = R_imu_to_body * mean_acc;
+    mean_gyr = R_imu_to_body * mean_gyr;
     first_lidar_time = meas.lidar_beg_time;
   }
 
@@ -209,17 +219,25 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
 
+    cur_acc = R_imu_to_body * cur_acc;
+    cur_gyr = R_imu_to_body * cur_gyr;
+
     mean_acc      += (cur_acc - mean_acc) / N;
     mean_gyr      += (cur_gyr - mean_gyr) / N;
 
     cov_acc = cov_acc * (N - 1.0) / N + (cur_acc - mean_acc).cwiseProduct(cur_acc - mean_acc) * (N - 1.0) / (N * N);
     cov_gyr = cov_gyr * (N - 1.0) / N + (cur_gyr - mean_gyr).cwiseProduct(cur_gyr - mean_gyr) * (N - 1.0) / (N * N);
 
-    // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
+    cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
+    cout<<"acc normalized: "<<cur_acc.normalized().transpose()<<" "<<mean_acc.normalized().transpose()<<endl;
 
     N ++;
   }
   state_ikfom init_state = kf_state.get_x();
+  V3D g_b = -mean_acc.normalized();
+  V3D g_w(0.0, 0.0, -1.0);
+  Eigen::Quaterniond q0 = Eigen::Quaterniond::FromTwoVectors(g_b, g_w);
+  init_state.rot = q0.toRotationMatrix();
   init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
   
   //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
@@ -279,11 +297,14 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     if (tail_stamp < last_lidar_end_time_)    continue;
     
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
-                0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
-                0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+          0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+          0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
     acc_avr   <<0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
-                0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
-                0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+          0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
+          0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+
+    angvel_avr = R_imu_to_body * angvel_avr;
+    acc_avr = R_imu_to_body * acc_avr;
 
     // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
 
@@ -417,9 +438,12 @@ void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const 
     
     latest_time_ = t;
     
+    V3D acc_body = R_imu_to_body * linear_acceleration;
+    V3D gyr_body = R_imu_to_body * angular_velocity;
+
     // Mid-point integration
     V3D un_acc_0 = latest_state_.rot * (latest_acc_ - latest_state_.ba) - V3D(0, 0, -G_m_s2);
-    V3D un_gyr = 0.5 * (latest_gyr_ + angular_velocity) - latest_state_.bg;
+    V3D un_gyr = 0.5 * (latest_gyr_ + gyr_body) - latest_state_.bg;
     
     // Update rotation
     Eigen::Quaterniond dq;
@@ -447,7 +471,7 @@ void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const 
     latest_state_.rot.vec()[2] = q.z();
     
     // Update acceleration and velocity
-    V3D un_acc_1 = latest_state_.rot * (linear_acceleration - latest_state_.ba) - V3D(0, 0, -G_m_s2);
+    V3D un_acc_1 = latest_state_.rot * (acc_body - latest_state_.ba) - V3D(0, 0, -G_m_s2);
     V3D un_acc = 0.5 * (un_acc_0 + un_acc_1);
     
     // Update position and velocity
@@ -455,8 +479,8 @@ void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const 
     latest_state_.vel = latest_state_.vel + dt * un_acc;
     
     // Store for next iteration
-    latest_acc_ = linear_acceleration;
-    latest_gyr_ = angular_velocity;
+    latest_acc_ = acc_body;
+    latest_gyr_ = gyr_body;
 }
 
 void ImuProcess::syncStateFromLidar(const state_ikfom &corrected_state)
@@ -464,7 +488,8 @@ void ImuProcess::syncStateFromLidar(const state_ikfom &corrected_state)
     if (!high_freq_enabled_) return;
     
     latest_state_ = corrected_state;
-    latest_time_ = rclcpp::Clock().now().seconds(); // Use current time
+    latest_time_ = last_lidar_end_time_;
+    // latest_time_ = rclcpp::Clock().now().seconds(); // Use current time
     
     // Reset preintegration with corrected state
     if(pre_integration_) {
