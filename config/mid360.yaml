@@ -48,7 +48,7 @@
             input_source: "livox"            # livox | world_cloud
             livox_topic: "/livox/lidar"      # used when input_source=livox
             cloud_topic: "/Laser_map"        # used when input_source=world_cloud
-            odom_topic: "/high_freq_odom"       # used for color mapping and time synchronization
+            odom_topic: "/Odometry"       # used for color mapping and time synchronization
             rgb_topic: "/camera/color/image_raw/compressed"
             depth_topic: "/camera/depth/image_raw/compressedDepth"
             camera_info_topic: "/camera/color/camera_info"
@@ -69,9 +69,9 @@
                             0.0, 0.0, 0.0, 1.0 ]
             invert_extrinsic: false
 
-            max_image_time_diff: 0.05   # 20hz
-            max_depth_time_diff: 0.05   # 20hz
-            max_odom_time_diff: 0.01    # 100hz
+            max_image_time_diff: 0.05   # 30hz
+            max_depth_time_diff: 0.05   # 30hz
+            max_odom_time_diff: 0.2    # 10hz
 
             use_depth_gate: true
             depth_tolerance: 0.5

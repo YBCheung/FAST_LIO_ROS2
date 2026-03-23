@@ -41,7 +41,24 @@ public:
     declare_parameter<double>("color_mapping.fy", 0.0);
     declare_parameter<double>("color_mapping.cx", 0.0);
     declare_parameter<double>("color_mapping.cy", 0.0);
+    declare_parameter<double>("color_mapping.depth_fx", 0.0);
+    declare_parameter<double>("color_mapping.depth_fy", 0.0);
+    declare_parameter<double>("color_mapping.depth_cx", 0.0);
+    declare_parameter<double>("color_mapping.depth_cy", 0.0);
     declare_parameter<bool>("color_mapping.use_camera_info", true);
+    declare_parameter<bool>("color_mapping.use_depth_to_color_extrinsics", true);
+    declare_parameter<std::vector<double>>(
+      "color_mapping.depth_to_color_rotation",
+      std::vector<double>{
+        0.999988317489624, -0.004466008860617876, -0.0018516527488827705,
+        0.004464889410883188, 0.9999898672103882, -0.0006083904881961644,
+        0.0018543510232120752, 0.0006001159781590104, 0.9999980926513672});
+    declare_parameter<std::vector<double>>(
+      "color_mapping.depth_to_color_translation",
+      std::vector<double>{
+        -0.023821550369262694,
+        -0.00010778414458036422,
+        0.0001281014233827591});
 
     declare_parameter<std::vector<double>>(
         "color_mapping.T_cam_lidar",
@@ -72,6 +89,7 @@ public:
     declare_parameter<double>("color_mapping.map_voxel_size", 0.10);
     declare_parameter<int>("color_mapping.publish_map_every_n", 5);
     declare_parameter<int>("color_mapping.max_queue_size", 100);
+    declare_parameter<int>("color_mapping.debug_log_every_n_frames", 10);
     declare_parameter<bool>("color_mapping.filter_livox_tags", true);
     declare_parameter<std::string>("color_mapping.world_frame", "world");
 
@@ -89,7 +107,17 @@ public:
     get_parameter("color_mapping.fy", fy_);
     get_parameter("color_mapping.cx", cx_);
     get_parameter("color_mapping.cy", cy_);
+    get_parameter("color_mapping.depth_fx", depth_fx_);
+    get_parameter("color_mapping.depth_fy", depth_fy_);
+    get_parameter("color_mapping.depth_cx", depth_cx_);
+    get_parameter("color_mapping.depth_cy", depth_cy_);
     get_parameter("color_mapping.use_camera_info", use_camera_info_);
+    get_parameter("color_mapping.use_depth_to_color_extrinsics", use_depth_to_color_extrinsics_);
+
+    std::vector<double> depth_to_color_r;
+    std::vector<double> depth_to_color_t;
+    get_parameter("color_mapping.depth_to_color_rotation", depth_to_color_r);
+    get_parameter("color_mapping.depth_to_color_translation", depth_to_color_t);
 
     std::vector<double> t_cam_lidar;
     get_parameter("color_mapping.T_cam_lidar", t_cam_lidar);
@@ -113,6 +141,7 @@ public:
     get_parameter("color_mapping.map_voxel_size", map_voxel_size_);
     get_parameter("color_mapping.publish_map_every_n", publish_map_every_n_);
     get_parameter("color_mapping.max_queue_size", max_queue_size_);
+    get_parameter("color_mapping.debug_log_every_n_frames", debug_log_every_n_frames_);
     get_parameter("color_mapping.filter_livox_tags", filter_livox_tags_);
     get_parameter("color_mapping.world_frame", world_frame_);
 
@@ -135,6 +164,25 @@ public:
     }
     r_cl_ = t_cl.block<3, 3>(0, 0);
     t_cl_ = t_cl.block<3, 1>(0, 3);
+
+    if (depth_to_color_r.size() == 9) {
+      r_cd_ << depth_to_color_r[0], depth_to_color_r[1], depth_to_color_r[2],
+          depth_to_color_r[3], depth_to_color_r[4], depth_to_color_r[5],
+          depth_to_color_r[6], depth_to_color_r[7], depth_to_color_r[8];
+    } else {
+      RCLCPP_WARN(get_logger(), "color_mapping.depth_to_color_rotation must contain 9 values. Using identity.");
+      r_cd_.setIdentity();
+    }
+
+    if (depth_to_color_t.size() == 3) {
+      t_cd_ << depth_to_color_t[0], depth_to_color_t[1], depth_to_color_t[2];
+    } else {
+      RCLCPP_WARN(get_logger(), "color_mapping.depth_to_color_translation must contain 3 values. Using zero.");
+      t_cd_.setZero();
+    }
+
+    r_dc_ = r_cd_.transpose();
+    t_dc_ = -r_dc_ * t_cd_;
 
     if (mapping_extrinsic_r.size() == 9) {
       r_li_ << mapping_extrinsic_r[0], mapping_extrinsic_r[1], mapping_extrinsic_r[2],
@@ -246,6 +294,134 @@ private:
     std::uint32_t count{0};
   };
 
+  enum class ProjectionRejectReason {
+    NONE = 0,
+    BEHIND_CAMERA,
+    OUT_OF_IMAGE,
+    DEPTH_READ_FAIL,
+    DEPTH_OUT_OF_RANGE,
+    DEPTH_MISMATCH,
+  };
+
+  enum class DepthReadRejectReason {
+    NONE = 0,
+    OUT_OF_BOUNDS,
+    BEHIND_DEPTH,
+    ZERO_DEPTH_16U,
+    INVALID_DEPTH_16U,
+    INVALID_DEPTH_32F,
+    UNSUPPORTED_ENCODING,
+  };
+
+  struct PointDropStats {
+    std::uint64_t input_points{0};
+    std::uint64_t filtered_by_tag{0};
+    std::uint64_t reject_behind_camera{0};
+    std::uint64_t reject_behind_depth{0};
+    std::uint64_t reject_out_of_image{0};
+    std::uint64_t reject_depth_read{0};
+    std::uint64_t reject_depth_read_oob{0};
+    std::uint64_t reject_depth_read_zero_16u{0};
+    std::uint64_t reject_depth_read_invalid_16u{0};
+    std::uint64_t reject_depth_read_invalid_32f{0};
+    std::uint64_t reject_depth_read_unsupported_encoding{0};
+    std::uint64_t reject_depth_range{0};
+    std::uint64_t reject_depth_mismatch{0};
+    std::uint64_t accepted_points{0};
+  };
+
+  void accumulatePointDropStats(const PointDropStats &frame_stats,
+                                PointDropStats &sum_stats) const {
+    sum_stats.input_points += frame_stats.input_points;
+    sum_stats.filtered_by_tag += frame_stats.filtered_by_tag;
+    sum_stats.reject_behind_camera += frame_stats.reject_behind_camera;
+    sum_stats.reject_behind_depth += frame_stats.reject_behind_depth;
+    sum_stats.reject_out_of_image += frame_stats.reject_out_of_image;
+    sum_stats.reject_depth_read += frame_stats.reject_depth_read;
+    sum_stats.reject_depth_read_oob += frame_stats.reject_depth_read_oob;
+    sum_stats.reject_depth_read_zero_16u += frame_stats.reject_depth_read_zero_16u;
+    sum_stats.reject_depth_read_invalid_16u += frame_stats.reject_depth_read_invalid_16u;
+    sum_stats.reject_depth_read_invalid_32f += frame_stats.reject_depth_read_invalid_32f;
+    sum_stats.reject_depth_read_unsupported_encoding += frame_stats.reject_depth_read_unsupported_encoding;
+    sum_stats.reject_depth_range += frame_stats.reject_depth_range;
+    sum_stats.reject_depth_mismatch += frame_stats.reject_depth_mismatch;
+    sum_stats.accepted_points += frame_stats.accepted_points;
+  }
+
+  void logPointDropStats(const char *mode,
+                         std::uint64_t frame_index,
+                         const PointDropStats &frame_stats,
+                         const PointDropStats &sum_stats) const {
+    const std::uint64_t frame_proj_drop =
+      frame_stats.reject_behind_camera + frame_stats.reject_behind_depth + frame_stats.reject_out_of_image +
+        frame_stats.reject_depth_read + frame_stats.reject_depth_range +
+        frame_stats.reject_depth_mismatch;
+
+    const std::uint64_t sum_proj_drop =
+      sum_stats.reject_behind_camera + sum_stats.reject_behind_depth + sum_stats.reject_out_of_image +
+        sum_stats.reject_depth_read + sum_stats.reject_depth_range +
+        sum_stats.reject_depth_mismatch;
+
+    const std::uint64_t dominant_drop_count = std::max(
+        {sum_stats.filtered_by_tag,
+         sum_stats.reject_behind_camera,
+       sum_stats.reject_behind_depth,
+         sum_stats.reject_out_of_image,
+         sum_stats.reject_depth_read,
+         sum_stats.reject_depth_range,
+         sum_stats.reject_depth_mismatch});
+
+    const char *dominant_drop_stage = "none";
+    if (dominant_drop_count > 0) {
+      if (dominant_drop_count == sum_stats.filtered_by_tag) {
+        dominant_drop_stage = "tag_filter";
+      } else if (dominant_drop_count == sum_stats.reject_behind_camera) {
+        dominant_drop_stage = "behind_camera";
+      } else if (dominant_drop_count == sum_stats.reject_behind_depth) {
+        dominant_drop_stage = "behind_depth";
+      } else if (dominant_drop_count == sum_stats.reject_out_of_image) {
+        dominant_drop_stage = "out_of_image";
+      } else if (dominant_drop_count == sum_stats.reject_depth_read) {
+        dominant_drop_stage = "depth_read_fail";
+      } else if (dominant_drop_count == sum_stats.reject_depth_range) {
+        dominant_drop_stage = "depth_out_of_range";
+      } else if (dominant_drop_count == sum_stats.reject_depth_mismatch) {
+        dominant_drop_stage = "depth_mismatch";
+      }
+    }
+
+    RCLCPP_INFO(
+        get_logger(),
+        "[ColorDebug][%s] frame=%llu frame_in=%llu frame_tag_drop=%llu frame_proj_drop=%llu frame_accept=%llu | "
+        "sum_in=%llu sum_tag_drop=%llu sum_behind=%llu sum_oob=%llu sum_color_passed=%llu sum_depth_read=%llu "
+        "(oob=%llu behind_depth=%llu zero16=%llu invalid16=%llu invalid32=%llu unsup=%llu) "
+        "sum_depth_range=%llu sum_depth_mismatch=%llu sum_proj_drop=%llu sum_accept=%llu dominant_drop=%s(%llu)",
+        mode,
+        static_cast<unsigned long long>(frame_index),
+        static_cast<unsigned long long>(frame_stats.input_points),
+        static_cast<unsigned long long>(frame_stats.filtered_by_tag),
+        static_cast<unsigned long long>(frame_proj_drop),
+        static_cast<unsigned long long>(frame_stats.accepted_points),
+        static_cast<unsigned long long>(sum_stats.input_points),
+        static_cast<unsigned long long>(sum_stats.filtered_by_tag),
+        static_cast<unsigned long long>(sum_stats.reject_behind_camera),
+        static_cast<unsigned long long>(sum_stats.reject_out_of_image),
+        static_cast<unsigned long long>(sum_stats.input_points - sum_stats.filtered_by_tag - sum_stats.reject_behind_camera - sum_stats.reject_out_of_image),
+        static_cast<unsigned long long>(sum_stats.reject_depth_read),
+        static_cast<unsigned long long>(sum_stats.reject_depth_read_oob),
+        static_cast<unsigned long long>(sum_stats.reject_behind_depth),
+        static_cast<unsigned long long>(sum_stats.reject_depth_read_zero_16u),
+        static_cast<unsigned long long>(sum_stats.reject_depth_read_invalid_16u),
+        static_cast<unsigned long long>(sum_stats.reject_depth_read_invalid_32f),
+        static_cast<unsigned long long>(sum_stats.reject_depth_read_unsupported_encoding),
+        static_cast<unsigned long long>(sum_stats.reject_depth_range),
+        static_cast<unsigned long long>(sum_stats.reject_depth_mismatch),
+        static_cast<unsigned long long>(sum_proj_drop),
+        static_cast<unsigned long long>(sum_stats.accepted_points),
+        dominant_drop_stage,
+        static_cast<unsigned long long>(dominant_drop_count));
+  }
+
   template <typename MsgT>
   typename MsgT::ConstSharedPtr findClosestByStamp(
       const std::deque<typename MsgT::ConstSharedPtr> &queue,
@@ -349,29 +525,49 @@ private:
   }
 
   bool readDepthMeters(const cv::Mat &depth_image, int u, int v,
-                       const std::string &encoding, double &depth_meters) const {
+                       const std::string &encoding, double &depth_meters,
+                       DepthReadRejectReason *reject_reason = nullptr) const {
+    if (reject_reason) {
+      *reject_reason = DepthReadRejectReason::NONE;
+    }
+
     if (u < 0 || v < 0 || u >= depth_image.cols || v >= depth_image.rows) {
+      if (reject_reason) {
+        *reject_reason = DepthReadRejectReason::OUT_OF_BOUNDS;
+      }
       return false;
     }
 
     if (encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
       const std::uint16_t value = depth_image.at<std::uint16_t>(v, u);
       if (value == 0) {
-        return false;
+        return true;  // high zero proportion is common for valid depth images, so we don't treat it as an error by default
       }
       depth_meters = static_cast<double>(value) * depth_scale_;
-      return std::isfinite(depth_meters);
+      if (!std::isfinite(depth_meters)) {
+        if (reject_reason) {
+          *reject_reason = DepthReadRejectReason::INVALID_DEPTH_16U;
+        }
+        return false;
+      }
+      return true;
     }
 
     if (encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
       const float value = depth_image.at<float>(v, u);
       if (!std::isfinite(value) || value <= 0.0f) {
+        if (reject_reason) {
+          *reject_reason = DepthReadRejectReason::INVALID_DEPTH_32F;
+        }
         return false;
       }
       depth_meters = static_cast<double>(value);
       return true;
     }
 
+    if (reject_reason) {
+      *reject_reason = DepthReadRejectReason::UNSUPPORTED_ENCODING;
+    }
     return false;
   }
 
@@ -424,9 +620,21 @@ private:
                             const std::string &depth_encoding,
                             std::uint8_t &r,
                             std::uint8_t &g,
-                            std::uint8_t &b) const {
+                            std::uint8_t &b,
+                            ProjectionRejectReason *reject_reason = nullptr,
+                            DepthReadRejectReason *depth_read_reject_reason = nullptr) const {
+    if (reject_reason) {
+      *reject_reason = ProjectionRejectReason::NONE;
+    }
+    if (depth_read_reject_reason) {
+      *depth_read_reject_reason = DepthReadRejectReason::NONE;
+    }
+
     const Eigen::Vector3d p_c = r_cl_ * p_l + t_cl_;
     if (p_c.z() <= 0.0) {
+      if (reject_reason) {
+        *reject_reason = ProjectionRejectReason::BEHIND_CAMERA;
+      }
       return false;
     }
 
@@ -436,18 +644,48 @@ private:
     const int v = static_cast<int>(std::lround(v_float));
 
     if (u < 0 || v < 0 || u >= rgb_img.cols || v >= rgb_img.rows) {
+      if (reject_reason) {
+        *reject_reason = ProjectionRejectReason::OUT_OF_IMAGE;
+      }
       return false;
     }
 
     if (use_depth_gate_) {
+      const Eigen::Vector3d p_d = use_depth_to_color_extrinsics_ ? (r_dc_ * p_c + t_dc_) : p_c;
+      if (p_d.z() <= 0.0) {
+        if (reject_reason) {
+          *reject_reason = ProjectionRejectReason::DEPTH_READ_FAIL;
+        }
+        if (depth_read_reject_reason) {
+          *depth_read_reject_reason = DepthReadRejectReason::BEHIND_DEPTH;
+        }
+        return false;
+      }
+
+      const int depth_u = static_cast<int>(std::lround(fx_ * (p_d.x() / p_d.z()) + cx_));
+      const int depth_v = static_cast<int>(std::lround(fy_ * (p_d.y() / p_d.z()) + cy_));
+
       double depth_m = 0.0;
-      if (!readDepthMeters(depth_img, u, v, depth_encoding, depth_m)) {
+      if (!readDepthMeters(depth_img, depth_u, depth_v, depth_encoding, depth_m, depth_read_reject_reason)) {
+        if (reject_reason) {
+          *reject_reason = ProjectionRejectReason::DEPTH_READ_FAIL;
+        }
         return false;
       }
-      if (depth_m < min_depth_ || depth_m > max_depth_) {
+
+      if (depth_m == 0.0) {
+        return true;  // treat zero depth as valid to avoid excessive rejections, especially for LiDAR points that often project to low-confidence depth pixels
+      }
+      if (depth_m > max_depth_) {
+        if (reject_reason) {
+          *reject_reason = ProjectionRejectReason::DEPTH_OUT_OF_RANGE;
+        }
         return false;
       }
-      if (std::abs(depth_m - p_c.z()) > depth_tolerance_) {
+      if (std::abs(depth_m - p_d.z()) > depth_tolerance_) {
+        if (reject_reason) {
+          *reject_reason = ProjectionRejectReason::DEPTH_MISMATCH;
+        }
         return false;
       }
     }
@@ -597,17 +835,36 @@ private:
     const cv::Mat &rgb_img = rgb_cv_ptr->image;
     const cv::Mat &depth_img = depth_cv_ptr->image;
 
+    int depth_zeros = cv::countNonZero(depth_img == 0);
+    int depth_total = depth_img.rows * depth_img.cols;
+    // RCLCPP_INFO(get_logger(), "Depth image zeros: %d / %d (%.2f%%)", depth_zeros, depth_total, 100.0 * depth_zeros / depth_total);
+
+    const auto &pose = odom_msg->pose.pose;
+    Eigen::Quaterniond q_wi(pose.orientation.w, pose.orientation.x,
+                            pose.orientation.y, pose.orientation.z);
+    if (q_wi.norm() < 1e-6) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Invalid odometry quaternion.");
+      return;
+    }
+    q_wi.normalize();
+
+    const Eigen::Matrix3d r_wi = q_wi.toRotationMatrix();
+    const Eigen::Vector3d t_wi(pose.position.x, pose.position.y, pose.position.z);
+    const Eigen::Matrix3d r_wl = r_wi * r_li_;
+    const Eigen::Vector3d t_wl = r_wi * t_li_ + t_wi;
+
     pcl::PointCloud<pcl::PointXYZRGB> colored_scan;
     colored_scan.reserve(msg->point_num);
 
-    Eigen::Matrix3d r_wi;
-    Eigen::Vector3d t_wi;
+    PointDropStats frame_stats;
+    frame_stats.input_points = static_cast<std::uint64_t>(msg->point_num);
 
-    int accepted_points = 0;
     for (const auto &pt : msg->points) {
       if (filter_livox_tags_) {
         const bool valid_tag = ((pt.tag & 0x30) == 0x10) || ((pt.tag & 0x30) == 0x00);
         if (!valid_tag) {
+          ++frame_stats.filtered_by_tag;
           continue;
         }
       }
@@ -617,16 +874,38 @@ private:
       std::uint8_t r = 0;
       std::uint8_t g = 0;
       std::uint8_t b = 0;
-      if (!projectAndColorPoint(p_l, rgb_img, depth_img, depth_cv_ptr->encoding, r, g, b)) {
+      ProjectionRejectReason reject_reason = ProjectionRejectReason::NONE;
+      DepthReadRejectReason depth_read_reject_reason = DepthReadRejectReason::NONE;
+      if (!projectAndColorPoint(p_l, rgb_img, depth_img, depth_cv_ptr->encoding,
+                                r, g, b, &reject_reason, &depth_read_reject_reason)) {
+        if (reject_reason == ProjectionRejectReason::BEHIND_CAMERA) {
+          ++frame_stats.reject_behind_camera;
+        } else if (reject_reason == ProjectionRejectReason::OUT_OF_IMAGE) {
+          ++frame_stats.reject_out_of_image;
+        } else if (reject_reason == ProjectionRejectReason::DEPTH_READ_FAIL) {
+          ++frame_stats.reject_depth_read;
+          if (depth_read_reject_reason == DepthReadRejectReason::OUT_OF_BOUNDS) {
+            ++frame_stats.reject_depth_read_oob;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::BEHIND_DEPTH) {
+            ++frame_stats.reject_behind_depth;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::ZERO_DEPTH_16U) {
+            ++frame_stats.reject_depth_read_zero_16u;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::INVALID_DEPTH_16U) {
+            ++frame_stats.reject_depth_read_invalid_16u;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::INVALID_DEPTH_32F) {
+            ++frame_stats.reject_depth_read_invalid_32f;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::UNSUPPORTED_ENCODING) {
+            ++frame_stats.reject_depth_read_unsupported_encoding;
+          }
+        } else if (reject_reason == ProjectionRejectReason::DEPTH_OUT_OF_RANGE) {
+          ++frame_stats.reject_depth_range;
+        } else if (reject_reason == ProjectionRejectReason::DEPTH_MISMATCH) {
+          ++frame_stats.reject_depth_mismatch;
+        }
         continue;
       }
 
-      Eigen::Vector3d p_w;
-      if (!computeWorldFromLidar(p_l, odom_msg, p_w, r_wi, t_wi)) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                             "Invalid odometry quaternion.");
-        return;
-      }
+      const Eigen::Vector3d p_w = r_wl * p_l + t_wl;
 
       pcl::PointXYZRGB colored_point;
       colored_point.x = static_cast<float>(p_w.x());
@@ -638,12 +917,19 @@ private:
 
       colored_scan.push_back(colored_point);
       updateVoxelMap(colored_point);
-      ++accepted_points;
+      ++frame_stats.accepted_points;
+    }
+
+    ++livox_frame_count_;
+    accumulatePointDropStats(frame_stats, livox_sum_stats_);
+    if (debug_log_every_n_frames_ > 0 &&
+        (livox_frame_count_ % static_cast<std::uint64_t>(debug_log_every_n_frames_)) == 0) {
+      logPointDropStats("livox", livox_frame_count_, frame_stats, livox_sum_stats_);
     }
 
     publishColoredScan(colored_scan, stamp);
 
-    if (accepted_points > 0) {
+    if (frame_stats.accepted_points > 0) {
       ++cloud_count_;
       if (cloud_count_ % std::max(1, publish_map_every_n_) == 0) {
         publishColoredMap(stamp);
@@ -686,7 +972,9 @@ private:
     pcl::PointCloud<pcl::PointXYZRGB> colored_scan;
     colored_scan.reserve(cloud_world.size());
 
-    int accepted_points = 0;
+    PointDropStats frame_stats;
+    frame_stats.input_points = static_cast<std::uint64_t>(cloud_world.size());
+
     for (const auto &pw : cloud_world.points) {
       const Eigen::Vector3d p_w(pw.x, pw.y, pw.z);
       const Eigen::Vector3d p_i = r_iw * (p_w - t_wi);
@@ -695,7 +983,34 @@ private:
       std::uint8_t r = 0;
       std::uint8_t g = 0;
       std::uint8_t b = 0;
-      if (!projectAndColorPoint(p_l, rgb_img, depth_img, depth_cv_ptr->encoding, r, g, b)) {
+      ProjectionRejectReason reject_reason = ProjectionRejectReason::NONE;
+      DepthReadRejectReason depth_read_reject_reason = DepthReadRejectReason::NONE;
+      if (!projectAndColorPoint(p_l, rgb_img, depth_img, depth_cv_ptr->encoding,
+                                r, g, b, &reject_reason, &depth_read_reject_reason)) {
+        if (reject_reason == ProjectionRejectReason::BEHIND_CAMERA) {
+          ++frame_stats.reject_behind_camera;
+        } else if (reject_reason == ProjectionRejectReason::OUT_OF_IMAGE) {
+          ++frame_stats.reject_out_of_image;
+        } else if (reject_reason == ProjectionRejectReason::DEPTH_READ_FAIL) {
+          ++frame_stats.reject_depth_read;
+          if (depth_read_reject_reason == DepthReadRejectReason::OUT_OF_BOUNDS) {
+            ++frame_stats.reject_depth_read_oob;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::BEHIND_DEPTH) {
+            ++frame_stats.reject_behind_depth;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::ZERO_DEPTH_16U) {
+            ++frame_stats.reject_depth_read_zero_16u;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::INVALID_DEPTH_16U) {
+            ++frame_stats.reject_depth_read_invalid_16u;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::INVALID_DEPTH_32F) {
+            ++frame_stats.reject_depth_read_invalid_32f;
+          } else if (depth_read_reject_reason == DepthReadRejectReason::UNSUPPORTED_ENCODING) {
+            ++frame_stats.reject_depth_read_unsupported_encoding;
+          }
+        } else if (reject_reason == ProjectionRejectReason::DEPTH_OUT_OF_RANGE) {
+          ++frame_stats.reject_depth_range;
+        } else if (reject_reason == ProjectionRejectReason::DEPTH_MISMATCH) {
+          ++frame_stats.reject_depth_mismatch;
+        }
         continue;
       }
 
@@ -709,12 +1024,19 @@ private:
 
       colored_scan.push_back(colored_point);
       updateVoxelMap(colored_point);
-      ++accepted_points;
+      ++frame_stats.accepted_points;
+    }
+
+    ++cloud_frame_count_;
+    accumulatePointDropStats(frame_stats, cloud_sum_stats_);
+    if (debug_log_every_n_frames_ > 0 &&
+        (cloud_frame_count_ % static_cast<std::uint64_t>(debug_log_every_n_frames_)) == 0) {
+      logPointDropStats("cloud", cloud_frame_count_, frame_stats, cloud_sum_stats_);
     }
 
     publishColoredScan(colored_scan, stamp);
 
-    if (accepted_points > 0) {
+    if (frame_stats.accepted_points > 0) {
       ++cloud_count_;
       if (cloud_count_ % std::max(1, publish_map_every_n_) == 0) {
         publishColoredMap(stamp);
@@ -738,6 +1060,10 @@ private:
   double fy_{0.0};
   double cx_{0.0};
   double cy_{0.0};
+  double depth_fx_{0.0};
+  double depth_fy_{0.0};
+  double depth_cx_{0.0};
+  double depth_cy_{0.0};
 
   double max_image_time_diff_{0.05};
   double max_depth_time_diff_{0.05};
@@ -746,6 +1072,7 @@ private:
   bool use_camera_info_{true};
   bool has_intrinsics_{false};
   bool use_depth_gate_{true};
+  bool use_depth_to_color_extrinsics_{true};
   bool invert_extrinsic_{false};
   bool filter_livox_tags_{true};
 
@@ -757,10 +1084,21 @@ private:
   double map_voxel_size_{0.10};
   int publish_map_every_n_{5};
   int max_queue_size_{100};
+  int debug_log_every_n_frames_{10};
   int cloud_count_{0};
+  std::uint64_t livox_frame_count_{0};
+  std::uint64_t cloud_frame_count_{0};
+
+  PointDropStats livox_sum_stats_;
+  PointDropStats cloud_sum_stats_;
 
   Eigen::Matrix3d r_cl_{Eigen::Matrix3d::Identity()};
   Eigen::Vector3d t_cl_{Eigen::Vector3d::Zero()};
+
+  Eigen::Matrix3d r_cd_{Eigen::Matrix3d::Identity()};
+  Eigen::Vector3d t_cd_{Eigen::Vector3d::Zero()};
+  Eigen::Matrix3d r_dc_{Eigen::Matrix3d::Identity()};
+  Eigen::Vector3d t_dc_{Eigen::Vector3d::Zero()};
 
   Eigen::Matrix3d r_li_{Eigen::Matrix3d::Identity()};
   Eigen::Vector3d t_li_{Eigen::Vector3d::Zero()};
