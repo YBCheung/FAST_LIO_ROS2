@@ -22,6 +22,8 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/int32_multi_array.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 class LidarCameraColorizerNode : public rclcpp::Node {
 public:
@@ -33,6 +35,7 @@ public:
     declare_parameter<std::string>("color_mapping.rgb_topic", "/camera/color/image_raw/compressed");
     declare_parameter<std::string>("color_mapping.depth_topic", "/camera/depth/image_raw/compressedDepth");
     declare_parameter<std::string>("color_mapping.camera_info_topic", "/camera/color/camera_info");
+    declare_parameter<std::string>("color_mapping.yolo_detections_topic", "/camera/color/image_raw/hailo_yolo/detections");
 
     declare_parameter<std::string>("color_mapping.colored_scan_topic", "/cloud_registered_color");
     declare_parameter<std::string>("color_mapping.colored_map_topic", "/laser_map_color");
@@ -92,6 +95,13 @@ public:
     declare_parameter<int>("color_mapping.debug_log_every_n_frames", 10);
     declare_parameter<bool>("color_mapping.filter_livox_tags", true);
     declare_parameter<std::string>("color_mapping.world_frame", "world");
+    declare_parameter<bool>("color_mapping.enable_yolo_lidar_fusion", true);
+    declare_parameter<double>("color_mapping.max_yolo_time_diff", 0.1);
+    declare_parameter<int>("color_mapping.min_points_per_3d_bbox", 8);
+    declare_parameter<int>("color_mapping.log_3d_target_every_n_frames", 5);
+    declare_parameter<bool>("color_mapping.publish_yolo_3d_markers", true);
+    declare_parameter<std::string>("color_mapping.yolo_3d_markers_topic", "/yolo_3d/markers");
+    declare_parameter<double>("color_mapping.yolo_marker_lifetime_sec", 0.25);
 
     std::string input_source;
     get_parameter("color_mapping.input_source", input_source);
@@ -101,6 +111,7 @@ public:
     get_parameter("color_mapping.rgb_topic", rgb_topic_);
     get_parameter("color_mapping.depth_topic", depth_topic_);
     get_parameter("color_mapping.camera_info_topic", camera_info_topic_);
+    get_parameter("color_mapping.yolo_detections_topic", yolo_detections_topic_);
     get_parameter("color_mapping.colored_scan_topic", colored_scan_topic_);
     get_parameter("color_mapping.colored_map_topic", colored_map_topic_);
     get_parameter("color_mapping.fx", fx_);
@@ -144,6 +155,13 @@ public:
     get_parameter("color_mapping.debug_log_every_n_frames", debug_log_every_n_frames_);
     get_parameter("color_mapping.filter_livox_tags", filter_livox_tags_);
     get_parameter("color_mapping.world_frame", world_frame_);
+    get_parameter("color_mapping.enable_yolo_lidar_fusion", enable_yolo_lidar_fusion_);
+    get_parameter("color_mapping.max_yolo_time_diff", max_yolo_time_diff_);
+    get_parameter("color_mapping.min_points_per_3d_bbox", min_points_per_3d_bbox_);
+    get_parameter("color_mapping.log_3d_target_every_n_frames", log_3d_target_every_n_frames_);
+    get_parameter("color_mapping.publish_yolo_3d_markers", publish_yolo_3d_markers_);
+    get_parameter("color_mapping.yolo_3d_markers_topic", yolo_3d_markers_topic_);
+    get_parameter("color_mapping.yolo_marker_lifetime_sec", yolo_marker_lifetime_sec_);
 
     if (t_cam_lidar.size() != 16) {
       RCLCPP_ERROR(get_logger(), "color_mapping.T_cam_lidar must contain 16 values. Using identity.");
@@ -219,6 +237,12 @@ public:
         odom_topic_, rclcpp::SensorDataQoS(),
         std::bind(&LidarCameraColorizerNode::odomCallback, this, std::placeholders::_1));
 
+    if (enable_yolo_lidar_fusion_) {
+      yolo_detections_sub_ = create_subscription<std_msgs::msg::Int32MultiArray>(
+        yolo_detections_topic_, rclcpp::QoS(10).best_effort(),
+        std::bind(&LidarCameraColorizerNode::yoloDetectionsCallback, this, std::placeholders::_1));
+    }
+
     if (input_source == "livox") {
       input_mode_ = InputMode::LIVOX_CUSTOM;
       livox_sub_ = create_subscription<livox_ros_driver2::msg::CustomMsg>(
@@ -234,6 +258,10 @@ public:
 
     colored_scan_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(colored_scan_topic_, 10);
     colored_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(colored_map_topic_, 2);
+    if (publish_yolo_3d_markers_) {
+      yolo_marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+          yolo_3d_markers_topic_, 10);
+    }
 
     RCLCPP_INFO(get_logger(), "Lidar-camera colorizer started.");
       RCLCPP_INFO(get_logger(), "Node initialization complete. Waiting for messages...");
@@ -246,6 +274,16 @@ public:
     }
     RCLCPP_INFO(get_logger(), "Pub topics: colored_scan=%s colored_map=%s",
                 colored_scan_topic_.c_str(), colored_map_topic_.c_str());
+    if (enable_yolo_lidar_fusion_) {
+      RCLCPP_INFO(get_logger(), "YOLO-LiDAR fusion enabled, detections topic: %s",
+                  yolo_detections_topic_.c_str());
+    } else {
+      RCLCPP_INFO(get_logger(), "YOLO-LiDAR fusion disabled.");
+    }
+    if (publish_yolo_3d_markers_) {
+      RCLCPP_INFO(get_logger(), "YOLO 3D marker topic: %s (lifetime=%.2fs)",
+                  yolo_3d_markers_topic_.c_str(), yolo_marker_lifetime_sec_);
+    }
 
     if (rgb_topic_.find("compressed") == std::string::npos) {
       RCLCPP_WARN(get_logger(),
@@ -328,6 +366,41 @@ private:
     std::uint64_t reject_depth_range{0};
     std::uint64_t reject_depth_mismatch{0};
     std::uint64_t accepted_points{0};
+  };
+
+  struct YoloDetection2D {
+    int class_id{-1};
+    int score_pct{0};
+    int x1{0};
+    int y1{0};
+    int x2{0};
+    int y2{0};
+  };
+
+  struct YoloFrameDetections {
+    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+    std::vector<YoloDetection2D> detections;
+  };
+
+  struct BBox3DAccumulator {
+    bool initialized{false};
+    std::size_t count{0};
+    Eigen::Vector3d min_pt{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d max_pt{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d sum_pt{Eigen::Vector3d::Zero()};
+
+    void add(const Eigen::Vector3d &p_w) {
+      if (!initialized) {
+        initialized = true;
+        min_pt = p_w;
+        max_pt = p_w;
+      } else {
+        min_pt = min_pt.cwiseMin(p_w);
+        max_pt = max_pt.cwiseMax(p_w);
+      }
+      sum_pt += p_w;
+      ++count;
+    }
   };
 
   void accumulatePointDropStats(const PointDropStats &frame_stats,
@@ -467,7 +540,8 @@ private:
                        nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg) {
     std::lock_guard<std::mutex> lock(data_mutex_);
 
-    if (rgb_queue_.empty() || depth_queue_.empty() || odom_queue_.empty()) {
+    const bool need_depth = use_depth_gate_;
+    if (rgb_queue_.empty() || odom_queue_.empty() || (need_depth && depth_queue_.empty())) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "Input queue empty near lidar stamp %.3f: rgb=%zu depth=%zu odom=%zu. "
@@ -477,7 +551,11 @@ private:
     }
 
     rgb_msg = findClosestByStamp<sensor_msgs::msg::CompressedImage>(rgb_queue_, stamp, max_image_time_diff_);
-    depth_msg = findClosestByStamp<sensor_msgs::msg::CompressedImage>(depth_queue_, stamp, max_depth_time_diff_);
+    if (need_depth) {
+      depth_msg = findClosestByStamp<sensor_msgs::msg::CompressedImage>(depth_queue_, stamp, max_depth_time_diff_);
+    } else {
+      depth_msg.reset();
+    }
     odom_msg = findClosestByStamp<nav_msgs::msg::Odometry>(odom_queue_, stamp, max_odom_time_diff_);
     int mask = 0;
     if (!rgb_msg) {
@@ -485,7 +563,7 @@ private:
                "No RGB image found for timestamp %.3f", stamp.seconds());
     mask |= 1;
     }
-    if (!depth_msg) {
+    if (need_depth && !depth_msg) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                "No depth image found for timestamp %.3f", stamp.seconds());
     mask |= 2;
@@ -522,6 +600,271 @@ private:
     std::lock_guard<std::mutex> lock(data_mutex_);
     odom_queue_.push_back(msg);
     pruneQueue<nav_msgs::msg::Odometry>(odom_queue_);
+  }
+
+  void yoloDetectionsCallback(const std_msgs::msg::Int32MultiArray::ConstSharedPtr &msg) {
+    ++yolo_frames_received_;
+    if (msg->data.size() < 3) {
+      ++yolo_frames_malformed_;
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "[YOLO2D] malformed message: size=%zu (<3)", msg->data.size());
+      return;
+    }
+
+    const int sec = msg->data[0];
+    const std::uint32_t nanosec = static_cast<std::uint32_t>(std::max(0, msg->data[1]));
+    int det_count = msg->data[2];
+    if (det_count < 0) {
+      det_count = 0;
+    }
+
+    const std::size_t expected = 3 + static_cast<std::size_t>(det_count) * 6;
+    if (msg->data.size() < expected) {
+      ++yolo_frames_malformed_;
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "[YOLO2D] malformed payload: size=%zu expected>=%zu det_count=%d",
+                           msg->data.size(), expected, det_count);
+      return;
+    }
+
+    YoloFrameDetections frame;
+    frame.stamp = rclcpp::Time(sec, nanosec, RCL_ROS_TIME);
+    frame.detections.reserve(static_cast<std::size_t>(det_count));
+
+    std::size_t offset = 3;
+    for (int i = 0; i < det_count; ++i) {
+      YoloDetection2D det;
+      det.class_id = msg->data[offset + 0];
+      det.score_pct = std::clamp(msg->data[offset + 1], 0, 100);
+      det.x1 = msg->data[offset + 2];
+      det.y1 = msg->data[offset + 3];
+      det.x2 = msg->data[offset + 4];
+      det.y2 = msg->data[offset + 5];
+      if (det.x2 > det.x1 && det.y2 > det.y1) {
+        frame.detections.push_back(det);
+      }
+      offset += 6;
+    }
+
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    yolo_detections_queue_.push_back(std::move(frame));
+    while (static_cast<int>(yolo_detections_queue_.size()) > max_queue_size_) {
+      yolo_detections_queue_.pop_front();
+    }
+
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "[YOLO2D] recv=%llu malformed=%llu queue=%zu latest_det=%d",
+        static_cast<unsigned long long>(yolo_frames_received_),
+        static_cast<unsigned long long>(yolo_frames_malformed_),
+        yolo_detections_queue_.size(), det_count);
+  }
+
+  bool getSyncedYoloDetections(const rclcpp::Time &stamp, YoloFrameDetections &out_frame) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (yolo_detections_queue_.empty()) {
+      ++yolo_sync_miss_count_;
+      return false;
+    }
+
+    double best_dt = std::numeric_limits<double>::max();
+    const YoloFrameDetections *best = nullptr;
+    for (auto it = yolo_detections_queue_.rbegin(); it != yolo_detections_queue_.rend(); ++it) {
+      const double dt = std::abs((it->stamp - stamp).seconds());
+      if (dt < best_dt) {
+        best_dt = dt;
+        best = &(*it);
+      } else if (it->stamp <= stamp) {
+        break;
+      }
+    }
+
+    if (best == nullptr || best_dt > max_yolo_time_diff_) {
+      ++yolo_sync_miss_count_;
+      RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "[YOLO2D] sync miss: queue=%zu best_dt=%.3f max_dt=%.3f miss=%llu hit=%llu",
+          yolo_detections_queue_.size(), best_dt, max_yolo_time_diff_,
+          static_cast<unsigned long long>(yolo_sync_miss_count_),
+          static_cast<unsigned long long>(yolo_sync_hit_count_));
+      return false;
+    }
+
+    out_frame = *best;
+    ++yolo_sync_hit_count_;
+    return true;
+  }
+
+  std::size_t getYoloQueueSize() {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    return yolo_detections_queue_.size();
+  }
+
+  bool projectPointToImageNoDepth(const Eigen::Vector3d &p_l,
+                                  int image_width,
+                                  int image_height,
+                                  int &u,
+                                  int &v) const {
+    const Eigen::Vector3d p_c = r_cl_ * p_l + t_cl_;
+    if (p_c.z() <= 0.0) {
+      return false;
+    }
+
+    const double u_float = fx_ * (p_c.x() / p_c.z()) + cx_;
+    const double v_float = fy_ * (p_c.y() / p_c.z()) + cy_;
+    u = static_cast<int>(std::lround(u_float));
+    v = static_cast<int>(std::lround(v_float));
+
+    if (u < 0 || v < 0 || u >= image_width || v >= image_height) {
+      return false;
+    }
+    return true;
+  }
+
+  void logYolo3DTargets(const char *mode,
+                        const YoloFrameDetections &frame,
+                        const std::vector<BBox3DAccumulator> &accumulators,
+                        const rclcpp::Time &stamp,
+                        std::uint64_t frame_index) {
+    if (log_3d_target_every_n_frames_ <= 0) {
+      return;
+    }
+    if ((frame_index % static_cast<std::uint64_t>(log_3d_target_every_n_frames_)) != 0) {
+      return;
+    }
+
+    const double dt = std::abs((frame.stamp - stamp).seconds());
+    for (std::size_t i = 0; i < frame.detections.size() && i < accumulators.size(); ++i) {
+      const auto &acc = accumulators[i];
+      if (acc.count < static_cast<std::size_t>(std::max(1, min_points_per_3d_bbox_))) {
+        continue;
+      }
+
+      const Eigen::Vector3d center = acc.sum_pt / static_cast<double>(acc.count);
+      const Eigen::Vector3d size = acc.max_pt - acc.min_pt;
+      const auto &det = frame.detections[i];
+      RCLCPP_INFO(
+          get_logger(),
+          "[YOLO3D][%s] dt=%.3f class_id=%d score=%d%% points=%zu center=(%.3f, %.3f, %.3f) size=(%.3f, %.3f, %.3f) min=(%.3f, %.3f, %.3f) max=(%.3f, %.3f, %.3f)",
+          mode,
+          dt,
+          det.class_id,
+          det.score_pct,
+          acc.count,
+          center.x(), center.y(), center.z(),
+          size.x(), size.y(), size.z(),
+          acc.min_pt.x(), acc.min_pt.y(), acc.min_pt.z(),
+          acc.max_pt.x(), acc.max_pt.y(), acc.max_pt.z());
+    }
+  }
+
+  std::array<float, 3> classColor(int class_id) const {
+    const int cid = std::max(0, class_id);
+    const float r = static_cast<float>(55 + ((29 * cid + 151) % 200)) / 255.0f;
+    const float g = static_cast<float>(55 + ((17 * cid + 71) % 200)) / 255.0f;
+    const float b = static_cast<float>(55 + ((37 * cid + 23) % 200)) / 255.0f;
+    return {r, g, b};
+  }
+
+  void publishYolo3DMarkers(const char *mode,
+                            const YoloFrameDetections &frame,
+                            const std::vector<BBox3DAccumulator> &accumulators,
+                            const rclcpp::Time &stamp) {
+    if (!publish_yolo_3d_markers_ || !yolo_marker_pub_) {
+      return;
+    }
+
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    visualization_msgs::msg::Marker clear_marker;
+    clear_marker.header.frame_id = world_frame_;
+    clear_marker.header.stamp = stamp;
+    clear_marker.ns = "yolo3d";
+    clear_marker.id = 0;
+    clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+    marker_array.markers.push_back(clear_marker);
+
+    int marker_id = 1;
+    for (std::size_t i = 0; i < frame.detections.size() && i < accumulators.size(); ++i) {
+      const auto &acc = accumulators[i];
+      if (acc.count < static_cast<std::size_t>(std::max(1, min_points_per_3d_bbox_))) {
+        continue;
+      }
+
+      const Eigen::Vector3d center = acc.sum_pt / static_cast<double>(acc.count);
+      const Eigen::Vector3d size = acc.max_pt - acc.min_pt;
+      const auto &det = frame.detections[i];
+      const auto color = classColor(det.class_id);
+
+      visualization_msgs::msg::Marker box;
+      box.header.frame_id = world_frame_;
+      box.header.stamp = stamp;
+      box.ns = std::string("yolo3d_box_") + mode;
+      box.id = marker_id++;
+      box.type = visualization_msgs::msg::Marker::CUBE;
+      box.action = visualization_msgs::msg::Marker::ADD;
+      box.pose.position.x = center.x();
+      box.pose.position.y = center.y();
+      box.pose.position.z = center.z();
+      box.pose.orientation.w = 1.0;
+      box.scale.x = std::max(0.05, size.x());
+      box.scale.y = std::max(0.05, size.y());
+      box.scale.z = std::max(0.05, size.z());
+      box.color.r = color[0];
+      box.color.g = color[1];
+      box.color.b = color[2];
+      box.color.a = 0.35f;
+      box.lifetime = rclcpp::Duration::from_seconds(std::max(0.05, yolo_marker_lifetime_sec_));
+      marker_array.markers.push_back(box);
+
+      visualization_msgs::msg::Marker center_marker;
+      center_marker.header.frame_id = world_frame_;
+      center_marker.header.stamp = stamp;
+      center_marker.ns = std::string("yolo3d_center_") + mode;
+      center_marker.id = marker_id++;
+      center_marker.type = visualization_msgs::msg::Marker::SPHERE;
+      center_marker.action = visualization_msgs::msg::Marker::ADD;
+      center_marker.pose.position.x = center.x();
+      center_marker.pose.position.y = center.y();
+      center_marker.pose.position.z = center.z();
+      center_marker.pose.orientation.w = 1.0;
+      center_marker.scale.x = 0.12;
+      center_marker.scale.y = 0.12;
+      center_marker.scale.z = 0.12;
+      center_marker.color.r = color[0];
+      center_marker.color.g = color[1];
+      center_marker.color.b = color[2];
+      center_marker.color.a = 0.95f;
+      center_marker.lifetime = rclcpp::Duration::from_seconds(std::max(0.05, yolo_marker_lifetime_sec_));
+      marker_array.markers.push_back(center_marker);
+
+      visualization_msgs::msg::Marker text;
+      text.header.frame_id = world_frame_;
+      text.header.stamp = stamp;
+      text.ns = std::string("yolo3d_text_") + mode;
+      text.id = marker_id++;
+      text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+      text.action = visualization_msgs::msg::Marker::ADD;
+      text.pose.position.x = center.x();
+      text.pose.position.y = center.y();
+      text.pose.position.z = center.z() + std::max(0.4, size.z() * 0.6);
+      text.pose.orientation.w = 1.0;
+      text.scale.z = 0.22;
+      text.color.r = 1.0f;
+      text.color.g = 1.0f;
+      text.color.b = 1.0f;
+      text.color.a = 0.95f;
+      text.lifetime = rclcpp::Duration::from_seconds(std::max(0.05, yolo_marker_lifetime_sec_));
+      text.text = "id=" + std::to_string(det.class_id) +
+                  " s=" + std::to_string(det.score_pct) + "%" +
+                  " n=" + std::to_string(acc.count) +
+                  " c=(" + std::to_string(center.x()) + "," +
+                  std::to_string(center.y()) + "," +
+                  std::to_string(center.z()) + ")";
+      marker_array.markers.push_back(text);
+    }
+
+    yolo_marker_pub_->publish(marker_array);
   }
 
   bool readDepthMeters(const cv::Mat &depth_image, int u, int v,
@@ -733,60 +1076,64 @@ private:
       return false;
     }
 
-    // Decode compressed depth image
-    cv::Mat depth_img;
-    try {
-      const auto &depth_data = depth_msg->data;
-      if (depth_data.empty()) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                             "Depth compressed image payload is empty.");
-        return false;
-      }
-
-      depth_img = cv::imdecode(depth_data, cv::IMREAD_UNCHANGED);
-
-      const bool is_compressed_depth =
-          depth_msg->format.find("compressedDepth") != std::string::npos;
-
-      if (depth_img.empty() && is_compressed_depth) {
-        constexpr unsigned char png_magic[] = {0x89, 0x50, 0x4E, 0x47};
-        auto png_it = std::search(depth_data.begin(), depth_data.end(),
-                                  std::begin(png_magic), std::end(png_magic));
-
-        if (png_it != depth_data.end()) {
-          const auto png_offset = static_cast<std::size_t>(
-              std::distance(depth_data.begin(), png_it));
-          std::vector<uint8_t> png_payload(depth_data.begin() + png_offset,
-                                           depth_data.end());
-          depth_img = cv::imdecode(png_payload, cv::IMREAD_UNCHANGED);
+    if (use_depth_gate_) {
+      // Decode compressed depth image
+      cv::Mat depth_img;
+      try {
+        const auto &depth_data = depth_msg->data;
+        if (depth_data.empty()) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                               "Depth compressed image payload is empty.");
+          return false;
         }
-      }
 
-      if (depth_img.empty()) {
-        RCLCPP_WARN_THROTTLE(
-            get_logger(), *get_clock(), 2000,
-            "Failed to decode depth compressed image. format='%s', bytes=%zu",
-            depth_msg->format.c_str(), depth_data.size());
+        depth_img = cv::imdecode(depth_data, cv::IMREAD_UNCHANGED);
+
+        const bool is_compressed_depth =
+            depth_msg->format.find("compressedDepth") != std::string::npos;
+
+        if (depth_img.empty() && is_compressed_depth) {
+          constexpr unsigned char png_magic[] = {0x89, 0x50, 0x4E, 0x47};
+          auto png_it = std::search(depth_data.begin(), depth_data.end(),
+                                    std::begin(png_magic), std::end(png_magic));
+
+          if (png_it != depth_data.end()) {
+            const auto png_offset = static_cast<std::size_t>(
+                std::distance(depth_data.begin(), png_it));
+            std::vector<uint8_t> png_payload(depth_data.begin() + png_offset,
+                                             depth_data.end());
+            depth_img = cv::imdecode(png_payload, cv::IMREAD_UNCHANGED);
+          }
+        }
+
+        if (depth_img.empty()) {
+          RCLCPP_WARN_THROTTLE(
+              get_logger(), *get_clock(), 2000,
+              "Failed to decode depth compressed image. format='%s', bytes=%zu",
+              depth_msg->format.c_str(), depth_data.size());
+          return false;
+        }
+
+        std::string depth_encoding;
+        if (depth_img.type() == CV_16UC1) {
+          depth_encoding = sensor_msgs::image_encodings::TYPE_16UC1;
+        } else if (depth_img.type() == CV_32FC1) {
+          depth_encoding = sensor_msgs::image_encodings::TYPE_32FC1;
+        } else {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                               "Unsupported decoded depth type: %d", depth_img.type());
+          return false;
+        }
+
+          depth_cv_ptr = std::make_shared<cv_bridge::CvImage>(
+            depth_msg->header, depth_encoding, depth_img);
+      } catch (const std::exception &e) {
+        RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+                              "Exception decoding depth compressed image in prepareSynchronizedData: %s", e.what());
         return false;
       }
-
-      std::string depth_encoding;
-      if (depth_img.type() == CV_16UC1) {
-        depth_encoding = sensor_msgs::image_encodings::TYPE_16UC1;
-      } else if (depth_img.type() == CV_32FC1) {
-        depth_encoding = sensor_msgs::image_encodings::TYPE_32FC1;
-      } else {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                             "Unsupported decoded depth type: %d", depth_img.type());
-        return false;
-      }
-
-        depth_cv_ptr = std::make_shared<cv_bridge::CvImage>(
-          depth_msg->header, depth_encoding, depth_img);
-    } catch (const std::exception &e) {
-      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
-                            "Exception decoding depth compressed image in prepareSynchronizedData: %s", e.what());
-      return false;
+    } else {
+      depth_cv_ptr.reset();
     }
 
     return true;
@@ -833,10 +1180,15 @@ private:
     }
 
     const cv::Mat &rgb_img = rgb_cv_ptr->image;
-    const cv::Mat &depth_img = depth_cv_ptr->image;
+    const cv::Mat depth_img = (depth_cv_ptr ? depth_cv_ptr->image : cv::Mat());
+    const std::string depth_encoding = (depth_cv_ptr ? depth_cv_ptr->encoding : std::string());
 
-    int depth_zeros = cv::countNonZero(depth_img == 0);
-    int depth_total = depth_img.rows * depth_img.cols;
+    int depth_zeros = 0;
+    int depth_total = 0;
+    if (use_depth_gate_ && !depth_img.empty()) {
+      depth_zeros = cv::countNonZero(depth_img == 0);
+      depth_total = depth_img.rows * depth_img.cols;
+    }
     // RCLCPP_INFO(get_logger(), "Depth image zeros: %d / %d (%.2f%%)", depth_zeros, depth_total, 100.0 * depth_zeros / depth_total);
 
     const auto &pose = odom_msg->pose.pose;
@@ -853,6 +1205,14 @@ private:
     const Eigen::Vector3d t_wi(pose.position.x, pose.position.y, pose.position.z);
     const Eigen::Matrix3d r_wl = r_wi * r_li_;
     const Eigen::Vector3d t_wl = r_wi * t_li_ + t_wi;
+
+    YoloFrameDetections yolo_frame;
+    const bool has_yolo = enable_yolo_lidar_fusion_ && getSyncedYoloDetections(stamp, yolo_frame) && !yolo_frame.detections.empty();
+    const double yolo_dt = has_yolo ? std::abs((yolo_frame.stamp - stamp).seconds()) : -1.0;
+    std::vector<BBox3DAccumulator> yolo_accumulators;
+    if (has_yolo) {
+      yolo_accumulators.resize(yolo_frame.detections.size());
+    }
 
     pcl::PointCloud<pcl::PointXYZRGB> colored_scan;
     colored_scan.reserve(msg->point_num);
@@ -871,12 +1231,26 @@ private:
 
       const Eigen::Vector3d p_l(pt.x, pt.y, pt.z);
 
+      if (has_yolo) {
+        int u = 0;
+        int v = 0;
+        if (projectPointToImageNoDepth(p_l, rgb_img.cols, rgb_img.rows, u, v)) {
+          const Eigen::Vector3d p_w = r_wl * p_l + t_wl;
+          for (std::size_t det_idx = 0; det_idx < yolo_frame.detections.size(); ++det_idx) {
+            const auto &det = yolo_frame.detections[det_idx];
+            if (u >= det.x1 && u <= det.x2 && v >= det.y1 && v <= det.y2) {
+              yolo_accumulators[det_idx].add(p_w);
+            }
+          }
+        }
+      }
+
       std::uint8_t r = 0;
       std::uint8_t g = 0;
       std::uint8_t b = 0;
       ProjectionRejectReason reject_reason = ProjectionRejectReason::NONE;
       DepthReadRejectReason depth_read_reject_reason = DepthReadRejectReason::NONE;
-      if (!projectAndColorPoint(p_l, rgb_img, depth_img, depth_cv_ptr->encoding,
+      if (!projectAndColorPoint(p_l, rgb_img, depth_img, depth_encoding,
                                 r, g, b, &reject_reason, &depth_read_reject_reason)) {
         if (reject_reason == ProjectionRejectReason::BEHIND_CAMERA) {
           ++frame_stats.reject_behind_camera;
@@ -921,11 +1295,29 @@ private:
     }
 
     ++livox_frame_count_;
+
+    if (debug_log_every_n_frames_ > 0 &&
+      (livox_frame_count_ % static_cast<std::uint64_t>(debug_log_every_n_frames_)) == 0) {
+      const std::size_t yolo_queue_size = enable_yolo_lidar_fusion_ ? getYoloQueueSize() : 0;
+      RCLCPP_INFO(
+        get_logger(),
+        "[FusionState][livox] frame=%llu has_yolo=%d yolo_det=%zu yolo_dt=%.3f queue=%zu sync_hit=%llu sync_miss=%llu",
+        static_cast<unsigned long long>(livox_frame_count_), has_yolo ? 1 : 0,
+        has_yolo ? yolo_frame.detections.size() : 0, yolo_dt, yolo_queue_size,
+        static_cast<unsigned long long>(yolo_sync_hit_count_),
+        static_cast<unsigned long long>(yolo_sync_miss_count_));
+    }
+
     accumulatePointDropStats(frame_stats, livox_sum_stats_);
     if (debug_log_every_n_frames_ > 0 &&
         (livox_frame_count_ % static_cast<std::uint64_t>(debug_log_every_n_frames_)) == 0) {
       logPointDropStats("livox", livox_frame_count_, frame_stats, livox_sum_stats_);
     }
+
+    if (has_yolo) {
+      logYolo3DTargets("livox", yolo_frame, yolo_accumulators, stamp, livox_frame_count_);
+    }
+    publishYolo3DMarkers("livox", yolo_frame, yolo_accumulators, stamp);
 
     publishColoredScan(colored_scan, stamp);
 
@@ -967,7 +1359,16 @@ private:
     pcl::fromROSMsg(*cloud_msg, cloud_world);
 
     const cv::Mat &rgb_img = rgb_cv_ptr->image;
-    const cv::Mat &depth_img = depth_cv_ptr->image;
+    const cv::Mat depth_img = (depth_cv_ptr ? depth_cv_ptr->image : cv::Mat());
+    const std::string depth_encoding = (depth_cv_ptr ? depth_cv_ptr->encoding : std::string());
+
+    YoloFrameDetections yolo_frame;
+    const bool has_yolo = enable_yolo_lidar_fusion_ && getSyncedYoloDetections(stamp, yolo_frame) && !yolo_frame.detections.empty();
+    const double yolo_dt = has_yolo ? std::abs((yolo_frame.stamp - stamp).seconds()) : -1.0;
+    std::vector<BBox3DAccumulator> yolo_accumulators;
+    if (has_yolo) {
+      yolo_accumulators.resize(yolo_frame.detections.size());
+    }
 
     pcl::PointCloud<pcl::PointXYZRGB> colored_scan;
     colored_scan.reserve(cloud_world.size());
@@ -980,12 +1381,25 @@ private:
       const Eigen::Vector3d p_i = r_iw * (p_w - t_wi);
       const Eigen::Vector3d p_l = r_li_.transpose() * (p_i - t_li_);
 
+      if (has_yolo) {
+        int u = 0;
+        int v = 0;
+        if (projectPointToImageNoDepth(p_l, rgb_img.cols, rgb_img.rows, u, v)) {
+          for (std::size_t det_idx = 0; det_idx < yolo_frame.detections.size(); ++det_idx) {
+            const auto &det = yolo_frame.detections[det_idx];
+            if (u >= det.x1 && u <= det.x2 && v >= det.y1 && v <= det.y2) {
+              yolo_accumulators[det_idx].add(p_w);
+            }
+          }
+        }
+      }
+
       std::uint8_t r = 0;
       std::uint8_t g = 0;
       std::uint8_t b = 0;
       ProjectionRejectReason reject_reason = ProjectionRejectReason::NONE;
       DepthReadRejectReason depth_read_reject_reason = DepthReadRejectReason::NONE;
-      if (!projectAndColorPoint(p_l, rgb_img, depth_img, depth_cv_ptr->encoding,
+      if (!projectAndColorPoint(p_l, rgb_img, depth_img, depth_encoding,
                                 r, g, b, &reject_reason, &depth_read_reject_reason)) {
         if (reject_reason == ProjectionRejectReason::BEHIND_CAMERA) {
           ++frame_stats.reject_behind_camera;
@@ -1028,11 +1442,29 @@ private:
     }
 
     ++cloud_frame_count_;
+
+    if (debug_log_every_n_frames_ > 0 &&
+      (cloud_frame_count_ % static_cast<std::uint64_t>(debug_log_every_n_frames_)) == 0) {
+      const std::size_t yolo_queue_size = enable_yolo_lidar_fusion_ ? getYoloQueueSize() : 0;
+      RCLCPP_INFO(
+        get_logger(),
+        "[FusionState][cloud] frame=%llu has_yolo=%d yolo_det=%zu yolo_dt=%.3f queue=%zu sync_hit=%llu sync_miss=%llu",
+        static_cast<unsigned long long>(cloud_frame_count_), has_yolo ? 1 : 0,
+        has_yolo ? yolo_frame.detections.size() : 0, yolo_dt, yolo_queue_size,
+        static_cast<unsigned long long>(yolo_sync_hit_count_),
+        static_cast<unsigned long long>(yolo_sync_miss_count_));
+    }
+
     accumulatePointDropStats(frame_stats, cloud_sum_stats_);
     if (debug_log_every_n_frames_ > 0 &&
         (cloud_frame_count_ % static_cast<std::uint64_t>(debug_log_every_n_frames_)) == 0) {
       logPointDropStats("cloud", cloud_frame_count_, frame_stats, cloud_sum_stats_);
     }
+
+    if (has_yolo) {
+      logYolo3DTargets("cloud", yolo_frame, yolo_accumulators, stamp, cloud_frame_count_);
+    }
+    publishYolo3DMarkers("cloud", yolo_frame, yolo_accumulators, stamp);
 
     publishColoredScan(colored_scan, stamp);
 
@@ -1052,6 +1484,8 @@ private:
   std::string rgb_topic_;
   std::string depth_topic_;
   std::string camera_info_topic_;
+  std::string yolo_detections_topic_;
+  std::string yolo_3d_markers_topic_;
   std::string colored_scan_topic_;
   std::string colored_map_topic_;
   std::string world_frame_;
@@ -1068,6 +1502,7 @@ private:
   double max_image_time_diff_{0.05};
   double max_depth_time_diff_{0.05};
   double max_odom_time_diff_{0.02};
+  double max_yolo_time_diff_{0.08};
 
   bool use_camera_info_{true};
   bool has_intrinsics_{false};
@@ -1075,6 +1510,8 @@ private:
   bool use_depth_to_color_extrinsics_{true};
   bool invert_extrinsic_{false};
   bool filter_livox_tags_{true};
+  bool enable_yolo_lidar_fusion_{true};
+  bool publish_yolo_3d_markers_{true};
 
   double depth_tolerance_{0.5};
   double depth_scale_{0.001};
@@ -1085,9 +1522,16 @@ private:
   int publish_map_every_n_{5};
   int max_queue_size_{100};
   int debug_log_every_n_frames_{10};
+  int min_points_per_3d_bbox_{8};
+  int log_3d_target_every_n_frames_{5};
+  double yolo_marker_lifetime_sec_{0.25};
   int cloud_count_{0};
   std::uint64_t livox_frame_count_{0};
   std::uint64_t cloud_frame_count_{0};
+  std::uint64_t yolo_frames_received_{0};
+  std::uint64_t yolo_frames_malformed_{0};
+  std::uint64_t yolo_sync_hit_count_{0};
+  std::uint64_t yolo_sync_miss_count_{0};
 
   PointDropStats livox_sum_stats_;
   PointDropStats cloud_sum_stats_;
@@ -1107,6 +1551,7 @@ private:
   std::deque<sensor_msgs::msg::CompressedImage::ConstSharedPtr> rgb_queue_;
   std::deque<sensor_msgs::msg::CompressedImage::ConstSharedPtr> depth_queue_;
   std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> odom_queue_;
+  std::deque<YoloFrameDetections> yolo_detections_queue_;
 
   std::unordered_map<VoxelKey, VoxelValue, VoxelKeyHasher> voxel_map_;
 
@@ -1116,9 +1561,11 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr rgb_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr depth_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr yolo_detections_sub_;
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_scan_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr colored_map_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr yolo_marker_pub_;
 };
 
 int main(int argc, char **argv) {
