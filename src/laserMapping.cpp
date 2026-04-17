@@ -351,61 +351,6 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     sig_buffer.notify_all();
 }
 
-// Forward declaration for high-frequency publisher
-rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubHighFreqOdom_global;
-
-// NEW: High-frequency IMU callback (processes every IMU at 200Hz)
-void imu_highfreq_callback(const sensor_msgs::msg::Imu::UniquePtr msg_in)
-{
-    if(!enable_highfreq_output || !pubHighFreqOdom_global) return;
-    
-    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
-    double timestamp = get_time_sec(msg->header.stamp);
-    
-    mtx_highfreq_state.lock();
-    
-    // Extract IMU data
-    V3D acc(msg->linear_acceleration.x, 
-            msg->linear_acceleration.y, 
-            msg->linear_acceleration.z);
-    V3D gyr(msg->angular_velocity.x,
-            msg->angular_velocity.y,
-            msg->angular_velocity.z);
-    
-    // Fast propagate state
-    p_imu->fastPredictIMU(timestamp, acc, gyr);
-    
-    // Get propagated state
-    state_ikfom propagated_state = p_imu->getLatestState();
-    
-    mtx_highfreq_state.unlock();
-    
-    // Publish high-frequency odometry
-    nav_msgs::msg::Odometry odom_highfreq;
-    odom_highfreq.header = msg->header;
-    odom_highfreq.header.frame_id = "world";
-    odom_highfreq.child_frame_id = "body";
-    
-    odom_highfreq.pose.pose.position.x = propagated_state.pos(0);
-    odom_highfreq.pose.pose.position.y = propagated_state.pos(1);
-    odom_highfreq.pose.pose.position.z = propagated_state.pos(2);
-    
-    Eigen::Quaterniond q(propagated_state.rot.w(),
-                         propagated_state.rot.vec()[0],
-                         propagated_state.rot.vec()[1],
-                         propagated_state.rot.vec()[2]);
-    odom_highfreq.pose.pose.orientation.w = q.w();
-    odom_highfreq.pose.pose.orientation.x = q.x();
-    odom_highfreq.pose.pose.orientation.y = q.y();
-    odom_highfreq.pose.pose.orientation.z = q.z();
-    
-    odom_highfreq.twist.twist.linear.x = propagated_state.vel(0);
-    odom_highfreq.twist.twist.linear.y = propagated_state.vel(1);
-    odom_highfreq.twist.twist.linear.z = propagated_state.vel(2);
-    
-    pubHighFreqOdom_global->publish(odom_highfreq);
-}
-
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
     publish_count ++;
@@ -684,13 +629,22 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, \ 
+    const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_mavros_odometry, \
+    std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
     odomAftMapped.header.frame_id = "world";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
     pubOdomAftMapped->publish(odomAftMapped);
+
+    // for mavros, 10hz
+    nav_msgs::msg::Odometry mavros_odometry = odomAftMapped;
+    mavros_odometry.header.frame_id = "map";
+    mavros_odometry.child_frame_id = "base_link";
+    pub_mavros_odometry->publish(mavros_odometry);
+
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -1005,20 +959,23 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
+
+        auto qos_reliable = rclcpp::QoS(rclcpp::KeepLast(10)).reliability(rclcpp::ReliabilityPolicy::Reliable);
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
-        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);    
+        pub_mavros_odometry = this->create_publisher<nav_msgs::msg::Odometry>("/mavros/odometry/out", qos_reliable);
+
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         
         // NEW: Create high-frequency odometry publisher and subscribe to IMU
         if (enable_high_freq) {
-            pubHighFreqOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/high_freq_odom", 1000);
-            pubHighFreqOdom_global = pubHighFreqOdom_;
+            pubHighFreqOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/high_freq_odom", qos_reliable);
             sub_imu_highfreq_ = this->create_subscription<sensor_msgs::msg::Imu>(
-                imu_topic, 2000, imu_highfreq_callback);
+                imu_topic, 2000, std::bind(&LaserMappingNode::imu_highfreq_callback, this, std::placeholders::_1));
             p_imu->enableHighFreqPropagation(true);
             RCLCPP_INFO(this->get_logger(), "High-frequency IMU propagation enabled at %d Hz", pub_freq);
         }
@@ -1045,6 +1002,53 @@ public:
     }
 
 private:
+    void imu_highfreq_callback(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+    {
+        if (!enable_highfreq_output || !pubHighFreqOdom_)
+            return;
+
+        sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+        double timestamp = get_time_sec(msg->header.stamp);
+
+        mtx_highfreq_state.lock();
+
+        V3D acc(msg->linear_acceleration.x,
+                msg->linear_acceleration.y,
+                msg->linear_acceleration.z);
+        V3D gyr(msg->angular_velocity.x,
+                msg->angular_velocity.y,
+                msg->angular_velocity.z);
+
+        p_imu->fastPredictIMU(timestamp, acc, gyr);
+        state_ikfom propagated_state = p_imu->getLatestState();
+
+        mtx_highfreq_state.unlock();
+
+        nav_msgs::msg::Odometry odom_highfreq;
+        odom_highfreq.header = msg->header;
+        odom_highfreq.header.frame_id = "world";
+        odom_highfreq.child_frame_id = "body";
+
+        odom_highfreq.pose.pose.position.x = propagated_state.pos(0);
+        odom_highfreq.pose.pose.position.y = propagated_state.pos(1);
+        odom_highfreq.pose.pose.position.z = propagated_state.pos(2);
+
+        Eigen::Quaterniond q(propagated_state.rot.w(),
+                             propagated_state.rot.vec()[0],
+                             propagated_state.rot.vec()[1],
+                             propagated_state.rot.vec()[2]);
+        odom_highfreq.pose.pose.orientation.w = q.w();
+        odom_highfreq.pose.pose.orientation.x = q.x();
+        odom_highfreq.pose.pose.orientation.y = q.y();
+        odom_highfreq.pose.pose.orientation.z = q.z();
+
+        odom_highfreq.twist.twist.linear.x = propagated_state.vel(0);
+        odom_highfreq.twist.twist.linear.y = propagated_state.vel(1);
+        odom_highfreq.twist.twist.linear.z = propagated_state.vel(2);
+
+        pubHighFreqOdom_->publish(odom_highfreq);
+    }
+
     void timer_callback()
     {
         if(sync_packages(Measures))
@@ -1159,7 +1163,7 @@ private:
             }
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_odometry(pubOdomAftMapped_, pub_mavros_odometry, tf_broadcaster_);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1234,6 +1238,8 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubHighFreqOdom_; // NEW: High-frequency odometry publisher
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_mavros_odometry;  // for mavros compatibility
+
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_highfreq_; // NEW: High-frequency IMU subscription
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
