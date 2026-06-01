@@ -207,8 +207,6 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     const auto &gyr_acc = meas.imu.front()->angular_velocity;
     mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
-    mean_acc = R_imu_to_body * mean_acc;
-    mean_gyr = R_imu_to_body * mean_gyr;
     first_lidar_time = meas.lidar_beg_time;
   }
 
@@ -218,9 +216,6 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     const auto &gyr_acc = imu->angular_velocity;
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
-
-    cur_acc = R_imu_to_body * cur_acc;
-    cur_gyr = R_imu_to_body * cur_gyr;
 
     mean_acc      += (cur_acc - mean_acc) / N;
     mean_gyr      += (cur_gyr - mean_gyr) / N;
@@ -302,9 +297,6 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     acc_avr   <<0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
           0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
           0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
-
-    angvel_avr = R_imu_to_body * angvel_avr;
-    acc_avr = R_imu_to_body * acc_avr;
 
     // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
 
@@ -437,13 +429,10 @@ void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const 
     if (dt <= 0) return; // Skip if time goes backwards
     
     latest_time_ = t;
-    
-    V3D acc_body = R_imu_to_body * linear_acceleration;
-    V3D gyr_body = R_imu_to_body * angular_velocity;
 
     // Mid-point integration
     V3D un_acc_0 = latest_state_.rot * (latest_acc_ - latest_state_.ba) - V3D(0, 0, -G_m_s2);
-    V3D un_gyr = 0.5 * (latest_gyr_ + gyr_body) - latest_state_.bg;
+    V3D un_gyr = 0.5 * (latest_gyr_ + angular_velocity) - latest_state_.bg;
     
     // Update rotation
     Eigen::Quaterniond dq;
@@ -471,7 +460,7 @@ void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const 
     latest_state_.rot.vec()[2] = q.z();
     
     // Update acceleration and velocity
-    V3D un_acc_1 = latest_state_.rot * (acc_body - latest_state_.ba) - V3D(0, 0, -G_m_s2);
+    V3D un_acc_1 = latest_state_.rot * (linear_acceleration - latest_state_.ba) - V3D(0, 0, -G_m_s2);
     V3D un_acc = 0.5 * (un_acc_0 + un_acc_1);
     
     // Update position and velocity
@@ -479,8 +468,8 @@ void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const 
     latest_state_.vel = latest_state_.vel + dt * un_acc;
     
     // Store for next iteration
-    latest_acc_ = acc_body;
-    latest_gyr_ = gyr_body;
+    latest_acc_ = linear_acceleration;
+    latest_gyr_ = angular_velocity;
 }
 
 void ImuProcess::syncStateFromLidar(const state_ikfom &corrected_state)

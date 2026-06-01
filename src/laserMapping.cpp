@@ -74,6 +74,7 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   enable_high_freq = false;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -86,7 +87,6 @@ condition_variable sig_buffer;
 
 // NEW: Global variables for high-frequency propagation
 std::mutex mtx_highfreq_state;
-bool enable_highfreq_output = true;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
@@ -631,19 +631,21 @@ void set_posestamp(T & out)
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, \ 
     const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_mavros_odometry, \
-    std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+    std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
+    rclcpp::Node * node)
 {
     odomAftMapped.header.frame_id = "world";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+    pubOdomAftMapped->publish(odomAftMapped); // /Odometry, 10hz
 
-    // for mavros, 10hz
+    // for mavros, 10hz - stamp with node clock so it's synchronized with other node publishers
     nav_msgs::msg::Odometry mavros_odometry = odomAftMapped;
     mavros_odometry.header.frame_id = "map";
     mavros_odometry.child_frame_id = "base_link";
-    pub_mavros_odometry->publish(mavros_odometry);
+    // mavros_odometry.header.stamp = node->get_clock()->now();
+    pub_mavros_odometry->publish(mavros_odometry);  // /mavros/odometry/out, 10hz
 
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
@@ -848,7 +850,7 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
         
         // NEW: High-frequency propagation parameters
-        this->declare_parameter<bool>("imu_propagation.enable_high_frequency", true);
+        this->declare_parameter<bool>("imu_propagation.enable_high_frequency", false);
         this->declare_parameter<int>("imu_propagation.publish_frequency", 200);
         this->declare_parameter<double>("imu_propagation.acc_n", 0.1);
         this->declare_parameter<double>("imu_propagation.gyr_n", 0.01);
@@ -892,16 +894,14 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
         
         // NEW: Get high-frequency propagation parameters
-        bool enable_high_freq = true;
         int pub_freq = 200;
         double acc_n = 0.1, gyr_n = 0.01, acc_w = 0.0001, gyr_w = 0.00001;
-        this->get_parameter_or<bool>("imu_propagation.enable_high_frequency", enable_high_freq, true);
+        this->get_parameter_or<bool>("imu_propagation.enable_high_frequency", enable_high_freq, false);
         this->get_parameter_or<int>("imu_propagation.publish_frequency", pub_freq, 200);
         this->get_parameter_or<double>("imu_propagation.acc_n", acc_n, 0.1);
         this->get_parameter_or<double>("imu_propagation.gyr_n", gyr_n, 0.01);
         this->get_parameter_or<double>("imu_propagation.acc_w", acc_w, 0.0001);
         this->get_parameter_or<double>("imu_propagation.gyr_w", gyr_w, 0.00001);
-        enable_highfreq_output = enable_high_freq;
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -960,20 +960,20 @@ public:
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
 
-        auto qos_reliable = rclcpp::QoS(rclcpp::KeepLast(10)).reliability(rclcpp::ReliabilityPolicy::Reliable);
+        // auto qos_best = rclcpp::QoS(rclcpp::KeepLast(1)).reliability(rclcpp::ReliabilityPolicy::BestEffort);
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
-        pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
-        pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
-        pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
-        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);    
-        pub_mavros_odometry = this->create_publisher<nav_msgs::msg::Odometry>("/mavros/odometry/out", qos_reliable);
+        pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 5);
+        pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 5);
+        pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 5);
+        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 5);
+        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 5);    
+        pub_mavros_odometry = this->create_publisher<nav_msgs::msg::Odometry>("/mavros/odometry/out", 1);
 
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         
         // NEW: Create high-frequency odometry publisher and subscribe to IMU
         if (enable_high_freq) {
-            pubHighFreqOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/high_freq_odom", qos_reliable);
+            pubHighFreqOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/high_freq_odom", 5);
             sub_imu_highfreq_ = this->create_subscription<sensor_msgs::msg::Imu>(
                 imu_topic, 2000, std::bind(&LaserMappingNode::imu_highfreq_callback, this, std::placeholders::_1));
             p_imu->enableHighFreqPropagation(true);
@@ -1004,7 +1004,7 @@ public:
 private:
     void imu_highfreq_callback(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     {
-        if (!enable_highfreq_output || !pubHighFreqOdom_)
+        if (!pubHighFreqOdom_)
             return;
 
         sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -1155,7 +1155,7 @@ private:
             double t_update_end = omp_get_wtime();
 
             // NEW: Sync high-frequency state with corrected lidar odometry
-            if (enable_highfreq_output)
+            if (enable_high_freq)
             {
                 mtx_highfreq_state.lock();
                 p_imu->syncStateFromLidar(state_point);
@@ -1163,7 +1163,7 @@ private:
             }
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, pub_mavros_odometry, tf_broadcaster_);
+            publish_odometry(pubOdomAftMapped_, pub_mavros_odometry, tf_broadcaster_, this);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();

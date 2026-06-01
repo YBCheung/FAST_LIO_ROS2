@@ -90,7 +90,7 @@
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
 
         imu_propagation:
-            enable_high_frequency: true
+            enable_high_frequency: false
             publish_frequency: 200  # Hz
             
             # Noise parameters for preintegration
