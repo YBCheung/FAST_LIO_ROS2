@@ -1055,6 +1055,8 @@ private:
             return;
 
         sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+        // same time base as imu_cbk, so the samples line up with lidar_end_time
+        msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
         double timestamp = get_time_sec(msg->header.stamp);
 
         mtx_highfreq_state.lock();
@@ -1067,9 +1069,12 @@ private:
                 msg->angular_velocity.z);
 
         p_imu->fastPredictIMU(timestamp, acc, gyr);
+        bool ready = p_imu->isHighFreqReady();
         state_ikfom propagated_state = p_imu->getLatestState();
 
         mtx_highfreq_state.unlock();
+        if (!ready)
+            return;   // no LiDAR-corrected state yet
 
         nav_msgs::msg::Odometry odom_highfreq;
         odom_highfreq.header = msg->header;
