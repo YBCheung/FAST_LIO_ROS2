@@ -133,6 +133,12 @@ V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
+/*** Pose of the LIO body (IMU) frame in the vehicle base_link, used for /mavros/odometry/out only ***/
+vector<double>       mavrosExtrinT(3, 0.0);
+vector<double>       mavrosExtrinR(9, 0.0);
+V3D LIO_T_wrt_Base(Zero3d);
+M3D LIO_R_wrt_Base(Eye3d);
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
@@ -638,26 +644,55 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
+
+    // Covariance of this scan, filled before publishing. ROS pose order is (x y z rx ry rz);
+    // the state order is pos(0..2), rot(3..5), vel(12..14). The rotation error is a body-frame
+    // (right) perturbation, so rotate it to world axes like the position block.
+    auto P = kf.get_P();
+    M3D R_wl = state_point.rot.toRotationMatrix();
+    Eigen::Matrix<double, 6, 6> J = Eigen::Matrix<double, 6, 6>::Identity();
+    J.block<3, 3>(3, 3) = R_wl;
+    Eigen::Matrix<double, 6, 6> P_pose = J * P.block<6, 6>(0, 0) * J.transpose();
+    M3D P_vel = P.block<3, 3>(12, 12);
+    for (int i = 0; i < 6; i ++)
+        for (int j = 0; j < 6; j ++)
+            odomAftMapped.pose.covariance[i*6 + j] = P_pose(i, j);
+
+    // Twist: world-frame linear velocity, the convention ego_planner's odometry callback uses.
+    // Angular velocity is not part of the state and stays zero.
+    odomAftMapped.twist.twist.linear.x = state_point.vel(0);
+    odomAftMapped.twist.twist.linear.y = state_point.vel(1);
+    odomAftMapped.twist.twist.linear.z = state_point.vel(2);
+    for (int i = 0; i < 3; i ++)
+        for (int j = 0; j < 3; j ++)
+            odomAftMapped.twist.covariance[i*6 + j] = P_vel(i, j);
     pubOdomAftMapped->publish(odomAftMapped); // /Odometry, 10hz
 
-    // for mavros, 10hz - stamp with node clock so it's synchronized with other node publishers
+    // For mavros: pose of base_link instead of the LIO body, and the twist in the child
+    // (body) frame, which is what the mavros odometry plugin assumes. Stamped with the
+    // scan end time, not the node clock, so PX4 knows how old the measurement is.
     nav_msgs::msg::Odometry mavros_odometry = odomAftMapped;
     mavros_odometry.header.frame_id = "map";
     mavros_odometry.child_frame_id = "base_link";
-    // mavros_odometry.header.stamp = node->get_clock()->now();
+    M3D R_wb = R_wl * LIO_R_wrt_Base.transpose();
+    V3D p_wb = state_point.pos - R_wb * LIO_T_wrt_Base;
+    Eigen::Quaterniond q_wb(R_wb);
+    mavros_odometry.pose.pose.position.x = p_wb(0);
+    mavros_odometry.pose.pose.position.y = p_wb(1);
+    mavros_odometry.pose.pose.position.z = p_wb(2);
+    mavros_odometry.pose.pose.orientation.x = q_wb.x();
+    mavros_odometry.pose.pose.orientation.y = q_wb.y();
+    mavros_odometry.pose.pose.orientation.z = q_wb.z();
+    mavros_odometry.pose.pose.orientation.w = q_wb.w();
+    V3D v_b = R_wb.transpose() * state_point.vel;
+    M3D P_vel_b = R_wb.transpose() * P_vel * R_wb;
+    mavros_odometry.twist.twist.linear.x = v_b(0);
+    mavros_odometry.twist.twist.linear.y = v_b(1);
+    mavros_odometry.twist.twist.linear.z = v_b(2);
+    for (int i = 0; i < 3; i ++)
+        for (int j = 0; j < 3; j ++)
+            mavros_odometry.twist.covariance[i*6 + j] = P_vel_b(i, j);
     pub_mavros_odometry->publish(mavros_odometry);  // /mavros/odometry/out, 10hz
-
-    auto P = kf.get_P();
-    for (int i = 0; i < 6; i ++)
-    {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
-    }
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "world";
@@ -848,6 +883,8 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<vector<double>>("mavros.extrinsic_T", vector<double>{0, 0, 0});
+        this->declare_parameter<vector<double>>("mavros.extrinsic_R", vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
         
         // NEW: High-frequency propagation parameters
         this->declare_parameter<bool>("imu_propagation.enable_high_frequency", false);
@@ -892,6 +929,8 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<vector<double>>("mavros.extrinsic_T", mavrosExtrinT, vector<double>{0, 0, 0});
+        this->get_parameter_or<vector<double>>("mavros.extrinsic_R", mavrosExtrinR, vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
         
         // NEW: Get high-frequency propagation parameters
         int pub_freq = 200;
@@ -928,6 +967,14 @@ public:
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
         p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+        if (mavrosExtrinT.size() != 3 || mavrosExtrinR.size() != 9)
+        {
+            RCLCPP_ERROR(this->get_logger(), "mavros.extrinsic_T/R need 3/9 values, using identity");
+            mavrosExtrinT = {0, 0, 0};
+            mavrosExtrinR = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        }
+        LIO_T_wrt_Base<<VEC_FROM_ARRAY(mavrosExtrinT);
+        LIO_R_wrt_Base<<MAT_FROM_ARRAY(mavrosExtrinR);
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));

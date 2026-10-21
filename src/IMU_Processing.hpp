@@ -63,6 +63,9 @@ class ImuProcess
   // NEW: Sync state from LiDAR odometry correction
   void syncStateFromLidar(const state_ikfom &corrected_state);
 
+  // True once the first LiDAR-corrected state has been received
+  bool isHighFreqReady() const { return hf_synced_; }
+
   ofstream fout_imu;
   V3D cov_acc;
   V3D cov_gyr;
@@ -101,6 +104,12 @@ class ImuProcess
   V3D latest_gyr_;
   double latest_time_;
   bool high_freq_enabled_;
+  bool hf_synced_ = false;
+
+  // Recent raw IMU samples, replayed on top of each LiDAR-corrected state (it arrives late)
+  struct HfImuSample { double t; V3D acc; V3D gyr; };
+  deque<HfImuSample> hf_imu_buf_;
+  void integrateHighFreq(double t, const V3D &acc_raw, const V3D &gyr);
   
   // NEW: IMU preintegration buffer
   std::shared_ptr<IMUPreintegration> pre_integration_;
@@ -233,7 +242,13 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   V3D g_w(0.0, 0.0, -1.0);
   Eigen::Quaterniond q0 = Eigen::Quaterniond::FromTwoVectors(g_b, g_w);
   init_state.rot = q0.toRotationMatrix();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+  // rot levels the world frame, so gravity must be given in that levelled world frame too
+  // (the upstream body-frame value -mean_acc/|mean_acc|*g only matches rot = identity)
+  init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
+  double init_tilt_deg = acos(std::min(1.0, std::max(-1.0, g_b.dot(g_w)))) * 57.29578;
+  cout << "[IMU init] sensor tilt from vertical " << init_tilt_deg << " deg over " << N << " samples, "
+       << "|acc| " << mean_acc.norm() << ", residual |rot*acc_n + grav_n| "
+       << (q0 * mean_acc.normalized() + g_w).norm() << endl;
   
   //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   init_state.bg  = mean_gyr;
@@ -424,14 +439,27 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
 void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const V3D &angular_velocity)
 {
     if (!high_freq_enabled_) return;
-    
+
+    hf_imu_buf_.push_back({t, linear_acceleration, angular_velocity});
+    while (!hf_imu_buf_.empty() && hf_imu_buf_.front().t < t - 1.0)
+        hf_imu_buf_.pop_front();
+
+    if (hf_synced_) integrateHighFreq(t, linear_acceleration, angular_velocity);
+}
+
+void ImuProcess::integrateHighFreq(double t, const V3D &acc_raw, const V3D &angular_velocity)
+{
     double dt = t - latest_time_;
     if (dt <= 0) return; // Skip if time goes backwards
-    
+
     latest_time_ = t;
 
+    // Same model as the filter: acc scaled to m/s^2 like UndistortPcl, a = R (acc - ba) + grav
+    const V3D linear_acceleration = acc_raw * G_m_s2 / mean_acc.norm();
+    const V3D grav(latest_state_.grav[0], latest_state_.grav[1], latest_state_.grav[2]);
+
     // Mid-point integration
-    V3D un_acc_0 = latest_state_.rot * (latest_acc_ - latest_state_.ba) - V3D(0, 0, -G_m_s2);
+    V3D un_acc_0 = latest_state_.rot * (latest_acc_ - latest_state_.ba) + grav;
     V3D un_gyr = 0.5 * (latest_gyr_ + angular_velocity) - latest_state_.bg;
     
     // Update rotation
@@ -460,7 +488,7 @@ void ImuProcess::fastPredictIMU(double t, const V3D &linear_acceleration, const 
     latest_state_.rot.vec()[2] = q.z();
     
     // Update acceleration and velocity
-    V3D un_acc_1 = latest_state_.rot * (linear_acceleration - latest_state_.ba) - V3D(0, 0, -G_m_s2);
+    V3D un_acc_1 = latest_state_.rot * (linear_acceleration - latest_state_.ba) + grav;
     V3D un_acc = 0.5 * (un_acc_0 + un_acc_1);
     
     // Update position and velocity
@@ -478,8 +506,26 @@ void ImuProcess::syncStateFromLidar(const state_ikfom &corrected_state)
     
     latest_state_ = corrected_state;
     latest_time_ = last_lidar_end_time_;
-    // latest_time_ = rclcpp::Clock().now().seconds(); // Use current time
-    
+
+    // The corrected state is for the scan end, which is already ~30 ms old: start from the
+    // last sample at or before it and replay every sample received since.
+    auto it = hf_imu_buf_.begin();
+    while (it != hf_imu_buf_.end() && it->t <= latest_time_) ++it;
+    if (it != hf_imu_buf_.begin())
+    {
+        auto prev = std::prev(it);
+        latest_acc_ = prev->acc * G_m_s2 / mean_acc.norm();
+        latest_gyr_ = prev->gyr;
+    }
+    else if (it != hf_imu_buf_.end())
+    {
+        latest_acc_ = it->acc * G_m_s2 / mean_acc.norm();
+        latest_gyr_ = it->gyr;
+    }
+    hf_synced_ = true;
+    for (; it != hf_imu_buf_.end(); ++it)
+        integrateHighFreq(it->t, it->acc, it->gyr);
+
     // Reset preintegration with corrected state
     if(pre_integration_) {
         pre_integration_.reset(new IMUPreintegration(

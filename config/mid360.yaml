@@ -6,7 +6,7 @@
         filter_size_surf: 0.5
         filter_size_map: 0.5
         cube_side_length: 1000.0
-        runtime_pos_log_enable: false
+        runtime_pos_log_enable: true     # bench test 2026-10-21: logs ba/grav to Log/pos_log.txt; set false for flight
         map_file_path: "./test.pcd"
 
         common:
@@ -39,10 +39,22 @@
         publish:
             path_en: true                # true: publish Path
             effect_map_en: false         # true: publish Effects
-            map_en: true                 # true: publish Map cloud
+            map_en: false                # true: publish Map cloud. Keep false in flight: it republishes the whole
+                                        # accumulated cloud every second and stalls /Odometry by 0.15-0.37 s
             scan_publish_en:  true       # false: close all the point cloud output
             dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+
+        mavros:
+            # Pose of the LIO body (MID-360 IMU) frame in the vehicle base_link (FLU): v_base = R * v_lio + T.
+            # Applied to /mavros/odometry/out only; /Odometry stays in the LIO body frame.
+            # R fitted 2026-10-21 from px4log/10_21_lidar_drone_ekf (LIO vs PX4 body rates, 3 flights,
+            # residual <= 3.5 deg): yaw 180 deg, pitch -21.8 deg, i.e. the LIO x axis points backwards
+            # and 22 deg up. Confirm against the mount before flying.
+            extrinsic_T: [ 0.0, 0.0, 0.0 ]   # not measured yet; set this or EKF2_EV_POS_X/Y/Z, not both
+            extrinsic_R: [ -0.9285, 0.0, 0.3714,
+                            0.0,   -1.0, 0.0,
+                            0.3714, 0.0, 0.9285 ]
 
         color_mapping:
             input_source: "livox"            # livox | world_cloud
