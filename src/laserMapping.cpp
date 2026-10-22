@@ -139,6 +139,12 @@ vector<double>       mavrosExtrinR(9, 0.0);
 V3D LIO_T_wrt_Base(Zero3d);
 M3D LIO_R_wrt_Base(Eye3d);
 
+/*** Optional 180 deg rotation about z of every published output (world and body frame), for a
+     LiDAR mounted facing backwards (param publish.flip_xy). The estimator and its map are not
+     affected; only what is published is rotated. ***/
+bool flip_xy = false;
+M3D R_out(Eye3d);
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
@@ -214,7 +220,7 @@ void pointBodyToWorld(const Matrix<T, 3, 1> &pi, Matrix<T, 3, 1> &po)
 void RGBpointBodyToWorld(PointType const * const pi, PointType * const po)
 {
     V3D p_body(pi->x, pi->y, pi->z);
-    V3D p_global(state_point.rot * (state_point.offset_R_L_I*p_body + state_point.offset_T_L_I) + state_point.pos);
+    V3D p_global(R_out * (state_point.rot * (state_point.offset_R_L_I*p_body + state_point.offset_T_L_I) + state_point.pos));
 
     po->x = p_global(0);
     po->y = p_global(1);
@@ -225,7 +231,7 @@ void RGBpointBodyToWorld(PointType const * const pi, PointType * const po)
 void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
 {
     V3D p_body_lidar(pi->x, pi->y, pi->z);
-    V3D p_body_imu(state_point.offset_R_L_I*p_body_lidar + state_point.offset_T_L_I);
+    V3D p_body_imu(R_out * (state_point.offset_R_L_I*p_body_lidar + state_point.offset_T_L_I));
 
     po->x = p_body_imu(0);
     po->y = p_body_imu(1);
@@ -622,17 +628,26 @@ void save_to_pcd()
     pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
 
+// Pose of a state in the published frames: world' = R_out world, body' = R_out body
+void output_pose(const state_ikfom &s, V3D &p, Eigen::Quaterniond &q)
+{
+    p = R_out * s.pos;
+    q = Eigen::Quaterniond(R_out * s.rot.toRotationMatrix() * R_out.transpose());
+}
+
 template<typename T>
 void set_posestamp(T & out)
 {
-    out.pose.position.x = state_point.pos(0);
-    out.pose.position.y = state_point.pos(1);
-    out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
-    
+    V3D p;
+    Eigen::Quaterniond q;
+    output_pose(state_point, p, q);
+    out.pose.position.x = p(0);
+    out.pose.position.y = p(1);
+    out.pose.position.z = p(2);
+    out.pose.orientation.x = q.x();
+    out.pose.orientation.y = q.y();
+    out.pose.orientation.z = q.z();
+    out.pose.orientation.w = q.w();
 }
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, \ 
@@ -647,35 +662,41 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
     // Covariance of this scan, filled before publishing. ROS pose order is (x y z rx ry rz);
     // the state order is pos(0..2), rot(3..5), vel(12..14). The rotation error is a body-frame
-    // (right) perturbation, so rotate it to world axes like the position block.
+    // (right) perturbation, so rotate it to world axes like the position block; R_out takes
+    // both to the published world frame.
     auto P = kf.get_P();
     M3D R_wl = state_point.rot.toRotationMatrix();
-    Eigen::Matrix<double, 6, 6> J = Eigen::Matrix<double, 6, 6>::Identity();
-    J.block<3, 3>(3, 3) = R_wl;
+    Eigen::Matrix<double, 6, 6> J = Eigen::Matrix<double, 6, 6>::Zero();
+    J.block<3, 3>(0, 0) = R_out;
+    J.block<3, 3>(3, 3) = R_out * R_wl;
     Eigen::Matrix<double, 6, 6> P_pose = J * P.block<6, 6>(0, 0) * J.transpose();
     M3D P_vel = P.block<3, 3>(12, 12);
+    V3D v_out = R_out * state_point.vel;
+    M3D P_vel_out = R_out * P_vel * R_out.transpose();
     for (int i = 0; i < 6; i ++)
         for (int j = 0; j < 6; j ++)
             odomAftMapped.pose.covariance[i*6 + j] = P_pose(i, j);
 
     // Twist: world-frame linear velocity, the convention ego_planner's odometry callback uses.
     // Angular velocity is not part of the state and stays zero.
-    odomAftMapped.twist.twist.linear.x = state_point.vel(0);
-    odomAftMapped.twist.twist.linear.y = state_point.vel(1);
-    odomAftMapped.twist.twist.linear.z = state_point.vel(2);
+    odomAftMapped.twist.twist.linear.x = v_out(0);
+    odomAftMapped.twist.twist.linear.y = v_out(1);
+    odomAftMapped.twist.twist.linear.z = v_out(2);
     for (int i = 0; i < 3; i ++)
         for (int j = 0; j < 3; j ++)
-            odomAftMapped.twist.covariance[i*6 + j] = P_vel(i, j);
+            odomAftMapped.twist.covariance[i*6 + j] = P_vel_out(i, j);
     pubOdomAftMapped->publish(odomAftMapped); // /Odometry, 10hz
 
     // For mavros: pose of base_link instead of the LIO body, and the twist in the child
     // (body) frame, which is what the mavros odometry plugin assumes. Stamped with the
-    // scan end time, not the node clock, so PX4 knows how old the measurement is.
+    // scan end time, not the node clock, so PX4 knows how old the measurement is. Its world
+    // frame is the published one (R_out), so the PX4 local frame matches /Odometry.
     nav_msgs::msg::Odometry mavros_odometry = odomAftMapped;
     mavros_odometry.header.frame_id = "map";
     mavros_odometry.child_frame_id = "base_link";
-    M3D R_wb = R_wl * LIO_R_wrt_Base.transpose();
-    V3D p_wb = state_point.pos - R_wb * LIO_T_wrt_Base;
+    M3D R_wb_lio = R_wl * LIO_R_wrt_Base.transpose();     // base_link in the estimator's world
+    V3D p_wb = R_out * (state_point.pos - R_wb_lio * LIO_T_wrt_Base);
+    M3D R_wb = R_out * R_wb_lio;
     Eigen::Quaterniond q_wb(R_wb);
     mavros_odometry.pose.pose.position.x = p_wb(0);
     mavros_odometry.pose.pose.position.y = p_wb(1);
@@ -851,6 +872,7 @@ public:
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
+        this->declare_parameter<bool>("publish.flip_xy", false);
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
@@ -897,6 +919,7 @@ public:
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
+        this->get_parameter_or<bool>("publish.flip_xy", flip_xy, false);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
@@ -975,6 +998,11 @@ public:
         }
         LIO_T_wrt_Base<<VEC_FROM_ARRAY(mavrosExtrinT);
         LIO_R_wrt_Base<<MAT_FROM_ARRAY(mavrosExtrinR);
+        if (flip_xy)
+        {
+            R_out = V3D(-1.0, -1.0, 1.0).asDiagonal();
+            RCLCPP_INFO(this->get_logger(), "publish.flip_xy: outputs rotated 180 deg about z (x, y reversed)");
+        }
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
@@ -1081,22 +1109,22 @@ private:
         odom_highfreq.header.frame_id = "world";
         odom_highfreq.child_frame_id = "body";
 
-        odom_highfreq.pose.pose.position.x = propagated_state.pos(0);
-        odom_highfreq.pose.pose.position.y = propagated_state.pos(1);
-        odom_highfreq.pose.pose.position.z = propagated_state.pos(2);
+        V3D p_hf;
+        Eigen::Quaterniond q;
+        output_pose(propagated_state, p_hf, q);
+        V3D v_hf = R_out * propagated_state.vel;
+        odom_highfreq.pose.pose.position.x = p_hf(0);
+        odom_highfreq.pose.pose.position.y = p_hf(1);
+        odom_highfreq.pose.pose.position.z = p_hf(2);
 
-        Eigen::Quaterniond q(propagated_state.rot.w(),
-                             propagated_state.rot.vec()[0],
-                             propagated_state.rot.vec()[1],
-                             propagated_state.rot.vec()[2]);
         odom_highfreq.pose.pose.orientation.w = q.w();
         odom_highfreq.pose.pose.orientation.x = q.x();
         odom_highfreq.pose.pose.orientation.y = q.y();
         odom_highfreq.pose.pose.orientation.z = q.z();
 
-        odom_highfreq.twist.twist.linear.x = propagated_state.vel(0);
-        odom_highfreq.twist.twist.linear.y = propagated_state.vel(1);
-        odom_highfreq.twist.twist.linear.z = propagated_state.vel(2);
+        odom_highfreq.twist.twist.linear.x = v_hf(0);
+        odom_highfreq.twist.twist.linear.y = v_hf(1);
+        odom_highfreq.twist.twist.linear.z = v_hf(2);
 
         pubHighFreqOdom_->publish(odom_highfreq);
     }

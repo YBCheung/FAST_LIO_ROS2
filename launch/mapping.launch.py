@@ -8,6 +8,7 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.conditions import IfCondition
 
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -22,6 +23,7 @@ def generate_launch_description():
     rviz_use = LaunchConfiguration('rviz')
     rviz_cfg = LaunchConfiguration('rviz_cfg')
     colorizer_use = LaunchConfiguration('colorizer')
+    flip_xy = LaunchConfiguration('flip_xy')
 
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
@@ -43,6 +45,10 @@ def generate_launch_description():
         'rviz_cfg', default_value=default_rviz_config_path,
         description='RViz config file path'
     )
+    declare_flip_xy_cmd = DeclareLaunchArgument(
+        'flip_xy', default_value='false',
+        description='Rotate all outputs 180 deg about z (x, y reversed), for a LiDAR mounted facing backwards'
+    )
     declare_colorizer_cmd = DeclareLaunchArgument(
         'colorizer', default_value='false',
         description='Run standalone lidar-camera colorizer node'
@@ -52,7 +58,8 @@ def generate_launch_description():
         package='fast_lio',
         executable='fastlio_mapping',
         parameters=[PathJoinSubstitution([config_path, config_file]),
-                    {'use_sim_time': use_sim_time}],
+                    {'use_sim_time': use_sim_time,
+                     'publish.flip_xy': ParameterValue(flip_xy, value_type=bool)}],
         output='screen'
     )
     rviz_node = Node(
@@ -76,6 +83,7 @@ def generate_launch_description():
     ld.add_action(declare_config_file_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
+    ld.add_action(declare_flip_xy_cmd)
     # ld.add_action(declare_colorizer_cmd)
 
     ld.add_action(fast_lio_node)
