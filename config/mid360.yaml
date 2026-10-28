@@ -6,7 +6,7 @@
         filter_size_surf: 0.5
         filter_size_map: 0.5
         cube_side_length: 1000.0
-        runtime_pos_log_enable: true     # bench test 2026-10-21: logs ba/grav to Log/pos_log.txt; set false for flight
+        runtime_pos_log_enable: false    # true only for bench tests: logs ba/grav to Log/pos_log.txt
         map_file_path: "./test.pcd"
 
         common:
@@ -52,9 +52,11 @@
             # residual <= 3.5 deg): yaw 180 deg, pitch -21.8 deg, i.e. the LIO x axis points backwards
             # and 22 deg up. Confirm against the mount before flying.
             extrinsic_T: [ 0.0, 0.0, 0.0 ]   # not measured yet; set this or EKF2_EV_POS_X/Y/Z, not both
-            extrinsic_R: [ -0.9285, 0.0, 0.3714,
-                            0.0,   -1.0, 0.0,
-                            0.3714, 0.0, 0.9285 ]
+            # Must be a rotation: the 4-digit version (|col| = 1.000025) made the EV quaternion
+            # non-unit and PX4 rejected it (logs 44/45). The node now orthonormalises it anyway.
+            extrinsic_R: [ -0.92848583, 0.0, 0.37136784,
+                            0.0,       -1.0, 0.0,
+                            0.37136784, 0.0, 0.92848583 ]
 
         color_mapping:
             input_source: "livox"            # livox | world_cloud

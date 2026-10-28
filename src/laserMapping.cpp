@@ -633,6 +633,7 @@ void output_pose(const state_ikfom &s, V3D &p, Eigen::Quaterniond &q)
 {
     p = R_out * s.pos;
     q = Eigen::Quaterniond(R_out * s.rot.toRotationMatrix() * R_out.transpose());
+    q.normalize();
 }
 
 template<typename T>
@@ -698,6 +699,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     V3D p_wb = R_out * (state_point.pos - R_wb_lio * LIO_T_wrt_Base);
     M3D R_wb = R_out * R_wb_lio;
     Eigen::Quaterniond q_wb(R_wb);
+    q_wb.normalize();   // PX4 rejects EV attitude with | |q| - 1 | > 1e-5
     mavros_odometry.pose.pose.position.x = p_wb(0);
     mavros_odometry.pose.pose.position.y = p_wb(1);
     mavros_odometry.pose.pose.position.z = p_wb(2);
@@ -705,8 +707,10 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     mavros_odometry.pose.pose.orientation.y = q_wb.y();
     mavros_odometry.pose.pose.orientation.z = q_wb.z();
     mavros_odometry.pose.pose.orientation.w = q_wb.w();
-    V3D v_b = R_wb.transpose() * state_point.vel;
-    M3D P_vel_b = R_wb.transpose() * P_vel * R_wb;
+    // vel / P_vel are in the estimator's world, so rotate with R_wb_lio (not R_wb, which
+    // includes R_out): with flip_xy the body x/y velocity came out negated.
+    V3D v_b = R_wb_lio.transpose() * state_point.vel;
+    M3D P_vel_b = R_wb_lio.transpose() * P_vel * R_wb_lio;
     mavros_odometry.twist.twist.linear.x = v_b(0);
     mavros_odometry.twist.twist.linear.y = v_b(1);
     mavros_odometry.twist.twist.linear.z = v_b(2);
@@ -998,6 +1002,22 @@ public:
         }
         LIO_T_wrt_Base<<VEC_FROM_ARRAY(mavrosExtrinT);
         LIO_R_wrt_Base<<MAT_FROM_ARRAY(mavrosExtrinR);
+        {
+            // A rounded extrinsic_R is not exactly orthonormal, and the quaternion built from it
+            // is then not unit length. PX4 drops EV attitude whose |q| is off by more than 1e-5
+            // (EKF2 UpdateExtVisionSample), which stopped EV yaw fusion and let the mag reset the
+            // heading by ~170 deg (px4log logs 44/45). Project onto the nearest rotation.
+            Eigen::JacobiSVD<M3D> svd(LIO_R_wrt_Base, Eigen::ComputeFullU | Eigen::ComputeFullV);
+            M3D R_ortho = svd.matrixU() * svd.matrixV().transpose();
+            if (R_ortho.determinant() < 0)
+            {
+                RCLCPP_ERROR(this->get_logger(), "mavros.extrinsic_R is a reflection (det < 0), using identity");
+                R_ortho.setIdentity();
+            }
+            else if ((R_ortho - LIO_R_wrt_Base).cwiseAbs().maxCoeff() > 1e-3)
+                RCLCPP_WARN(this->get_logger(), "mavros.extrinsic_R is far from a rotation, orthonormalised");
+            LIO_R_wrt_Base = R_ortho;
+        }
         if (flip_xy)
         {
             R_out = V3D(-1.0, -1.0, 1.0).asDiagonal();
