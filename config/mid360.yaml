@@ -42,21 +42,27 @@
             map_en: false                # true: publish Map cloud. Keep false in flight: it republishes the whole
                                         # accumulated cloud every second and stalls /Odometry by 0.15-0.37 s
             scan_publish_en:  true       # false: close all the point cloud output
-            dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
+            dense_publish_en: true       # true since 2026-10-28: the planner's debris filter (plan_env cloud_filter) needs every point (~6k/scan); false = 0.5 m voxel centroids
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
         mavros:
-            # Pose of the LIO body (MID-360 IMU) frame in the vehicle base_link (FLU): v_base = R * v_lio + T.
-            # Applied to /mavros/odometry/out only; /Odometry stays in the LIO body frame.
-            # R fitted 2026-10-21 from px4log/10_21_lidar_drone_ekf (LIO vs PX4 body rates, 3 flights,
-            # residual <= 3.5 deg): yaw 180 deg, pitch -21.8 deg, i.e. the LIO x axis points backwards
-            # and 22 deg up. Confirm against the mount before flying.
+            # Pose of the *published* body frame (/Odometry's child "body", i.e. after publish.flip_xy)
+            # in the vehicle base_link (FLU): v_base = R * v_body + T. Applied to
+            # /mavros/odometry/out only; /Odometry is unchanged. The mount direction is NOT in here:
+            # flip_xy carries it (Jetson "123": backwards, flip_xy true; Pi "146": forwards, false),
+            # so both drones share this file. Before 2026-10-28 R was relative to the raw LIO body
+            # and held the Jetson's 180 deg yaw, which fed PX4 a heading 180 deg off on the 146.
+            # Both mounts are the same ~22 deg bracket (LiDAR top tilted towards the nose):
+            #   Jetson: fitted 2026-10-21 on body rates, px4log/10_21_lidar_drone_ekf, pitch 21.8, residual <= 3.5 deg
+            #   146:    static gravity check 2026-10-28, pitch 21.4, roll -1.5
+            # The node logs the resulting LIO-body -> base_link rotation at start-up.
             extrinsic_T: [ 0.0, 0.0, 0.0 ]   # not measured yet; set this or EKF2_EV_POS_X/Y/Z, not both
             # Must be a rotation: the 4-digit version (|col| = 1.000025) made the EV quaternion
             # non-unit and PX4 rejected it (logs 44/45). The node now orthonormalises it anyway.
-            extrinsic_R: [ -0.92848583, 0.0, 0.37136784,
-                            0.0,       -1.0, 0.0,
-                            0.37136784, 0.0, 0.92848583 ]
+            # Ry(21.8 deg):
+            extrinsic_R: [  0.92848583, 0.0, 0.37136784,
+                            0.0,        1.0, 0.0,
+                           -0.37136784, 0.0, 0.92848583 ]
 
         color_mapping:
             input_source: "livox"            # livox | world_cloud

@@ -1023,6 +1023,15 @@ public:
             R_out = V3D(-1.0, -1.0, 1.0).asDiagonal();
             RCLCPP_INFO(this->get_logger(), "publish.flip_xy: outputs rotated 180 deg about z (x, y reversed)");
         }
+        // mavros.extrinsic_R is the published body (after flip_xy) in base_link, so drones that
+        // differ only in the mount direction share it and flip_xy is the one per-drone switch.
+        // publish_odometry() needs the raw LIO body: base <- body' <- body.
+        LIO_R_wrt_Base = LIO_R_wrt_Base * R_out;
+        {
+            V3D e = RotMtoEuler(LIO_R_wrt_Base) * 180.0 / M_PI;
+            RCLCPP_INFO(this->get_logger(), "/mavros/odometry/out: base_link = LIO body rotated by roll %.1f pitch %.1f yaw %.1f deg",
+                        e(0), e(1), e(2));
+        }
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
